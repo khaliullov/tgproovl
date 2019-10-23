@@ -1,0 +1,871 @@
+# -*- coding: utf-8 -*-
+
+import copy
+import json
+import os
+import select
+import socket
+import sys
+import time
+import traceback
+
+from flask import Flask, request
+from flask_apscheduler import APScheduler
+from googletrans import Translator
+import requests
+import telegram
+from telegram.ext import Dispatcher, CommandHandler, ConversationHandler,\
+    MessageHandler, Filters, CallbackQueryHandler
+
+from tgproovl.extendedpersistence import ExtendedPersistence
+from tgproovl.tgclient import TgClient
+
+
+APP_CONFIG = os.environ.get('TGBOT_CONFIG', 'config.MainConfig')
+PASSWORD, CONFIG, USERS, NEW_USER, SMS, PHONES_MENU, NEW_PHONE, PHONE_EDIT,\
+    NEW_REPLY, SET_PHONE_PROPERTY = range(10)
+SMS_STATUS_RU = {
+    'Sent': 'Отправлено',
+    'Fail': 'Ошибка',
+    'Delivered': 'Доставлено',
+    'Undelivered': 'Не доставлено',
+}
+
+
+app = Flask(__name__)
+scheduler = APScheduler()
+app.config.from_object(APP_CONFIG)
+app.bot = telegram.Bot(app.config['TELEGRAM_TOKEN'])
+app.translator = Translator()
+app.bot_persistence = ExtendedPersistence(filename=app.config['PERSISTENCE_PATH'])
+app.dispatcher = Dispatcher(bot=app.bot, update_queue=None,
+                            workers=app.config['TELEGRAM_WORKERS'],
+                            persistence=app.bot_persistence, use_context=True)
+app.bot.setWebhook(url='https://%s%s%s' % (app.config['SERVER_NAME'],
+                                           app.config['APPLICATION_ROOT'],
+                                           app.config['TELEGRAM_TOKEN']))
+app.human = TgClient(app.config['TELEGRAM_API_ID'],
+                     app.config['TELEGRAM_API_HASH'],
+                     use_message_database=False, tdlib_verbosity=2,
+                     bot=app.bot, phone=app.config['TELEGRAM_PHONE'],
+                     database_encryption_key='abret' + app.config['TELEGRAM_PHONE'] + 'bgty',
+                     system_version='Linux',
+                     library_path='/tmp/td/tdlib/lib/libtdjson.so.1.5.0',
+                     bot_owner=app.config['TELEGRAM_OWNER'])
+
+
+@app.route(app.config['APPLICATION_ROOT'] + 'healthcheck')
+def smoke_test():
+    return 'OK'
+
+
+def tgcli_send_command(cmd):
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server_address = (app.config['TELEGRAM_CLI_HOST'],
+                      app.config['TELEGRAM_CLI_PORT'])
+    sock.connect(server_address)
+    try:
+        message = cmd + '\n'
+        sock.sendall(message.encode('utf-8'))
+        sock.setblocking(0)
+        data = []
+        b = b' '
+        while '\n' not in b.decode():
+            ready = select.select([sock], [], [], 5)
+            if ready[0]:
+                b = sock.recv(16)
+            else:
+                return {'result': 'FAIL'}
+            data.append(b)
+        data = "".join([x.decode('utf-8') for x in data])
+        data = data.replace("ANSWER", "")
+        amount_expected = int(data.split('\n')[0].strip())
+        amount_received = 16 - (len("ANSWER") + 1 +
+                                len(str(amount_expected)) + 1)
+        res = data.split('\n')[1].encode('utf-8')
+        while amount_received < amount_expected:
+            data = sock.recv(16)
+            amount_received += len(data)
+            res += data
+        res = res.decode()
+    except Exception as exc:
+        app.bot.send_message(chat_id=app.config['TELEGRAM_DEVELOPER'],
+                             text='Exception while sending *{0}*: *{1}*'.format(
+                                 cmd, str(exc)),
+                             parse_mode=telegram.ParseMode.MARKDOWN)
+        return {'result': 'FAIL'}
+    finally:
+        sock.close()
+    return json.loads(res)
+
+
+authorization_state = None
+
+
+@scheduler.task('interval', id='get_sms', seconds=10, coalesce=False)
+def check_sms_and_chats():
+    if not app.human._authorized:
+        app.human.login_async()
+    now = int(time.time())
+    if not app.bot_persistence.state \
+            or 'phones' not in app.bot_persistence.state \
+            or 'sms' not in app.bot_persistence.state:
+        print('skipping SMS and Chats check')
+        return
+    print('Running SMS and Chats check')
+    for receiver in app.bot_persistence.state['phones']:
+        to_remove = []
+        for sender in app.bot_persistence.state['phones'][receiver]['chats']:
+            chat = app.bot_persistence.state['phones'][receiver]['chats'][
+                sender]
+            if chat['last_message'] + app.config['CHAT_HALF_TIMEOUT'] < now:
+                if 'try' not in chat:
+                    chat['try'] = 1
+                    try:
+                        app.bot.send_message(
+                            chat_id=chat['chat_id'],
+                            text='В чате давно не было новых сообщений. Жду ещё {0} секунд и закрываю'.format(
+                                app.config['CHAT_HALF_TIMEOUT']),
+                            parse_mode=telegram.ParseMode.MARKDOWN)
+                    except telegram.error.Unauthorized:
+                        to_remove.append(sender)
+                    continue
+            if chat['last_message'] + app.config['CHAT_HALF_TIMEOUT'] * 2 < now:
+                users = set([str(app.bot_persistence.state['bot_id'])])
+                for user_id in app.bot_persistence.state['operators'].keys():
+                    users.add(str(user_id))
+                users.discard(str(app.bot_persistence.state['self']))
+                users.add(str(app.bot_persistence.state['self']))
+                for user in users:
+                    result = tgcli_send_command('chat_del_user chat#{0} user#{1}'.
+                                                format(abs(chat['chat_id']), user))
+                    if 'result' in result:
+                        continue
+                to_remove.append(sender)
+        for item in to_remove:
+            app.bot_persistence.state['phones'][receiver]['chats'].pop(item, None)
+    to_remove = []
+    for _id in app.bot_persistence.state['sms']:
+        sms = app.bot_persistence.state['sms'][_id]
+        if sms['timestamp'] + app.config['SMS_HALF_TIMEOUT'] < now:
+            if 'try' not in sms:
+                sms['try'] = 1
+                if ('incoming' not in app.bot_persistence.state['phones'][sms['from']]['chats'][sms['to']]
+                    or app.bot_persistence.state['phones'][sms['from']]['chats'][sms['to']]['incoming'] < 2) \
+                        and sms['status'] != 'Delivered':
+                    if sms['to'] in app.bot_persistence.state['phones'][sms['from']]['chats']:
+                        try:
+                            app.bot.send_message(
+                                chat_id=app.bot_persistence.state['sms'][_id]['chat_id'],
+                                reply_to_message_id=sms['reply_to_message_id'],
+                                text="Сообщение до сих пор со статусом *{0}*".format(SMS_STATUS_RU.get(sms['status'], sms['status'])),
+                                parse_mode=telegram.ParseMode.MARKDOWN)
+                        except telegram.error.Unauthorized:
+                            to_remove.append(_id)
+                            continue
+        if sms['timestamp'] + app.config['SMS_HALF_TIMEOUT'] * 2 < now:
+            to_remove.append(_id)
+    for item in to_remove:
+        app.bot_persistence.state['sms'].pop(item, None)
+    app.bot_persistence.update_state(app.bot_persistence.state)
+    print('state:')
+    print(app.bot_persistence.state)
+    print('SMS and Chats check ended')
+
+
+def init_receiver(phone):
+    if phone not in app.bot_persistence.state['phones']:
+        app.bot_persistence.state['phones'][phone] = {
+            'nick': phone,
+            'site': '',
+            'regulars': {},
+            'replies': {},
+            'chats': {},
+        }
+        app.bot_persistence.update_state(app.bot_persistence.state)
+
+
+def send_sms(_from, to, text, tariff=app.config['PROOVL_TARIFF']):
+    r = requests.post('https://tv.localix.ru/tgproovl/send.php',  # 'https://www.proovl.com/api/balance.php',
+                      params={'user': app.config['PROOVL_USER'],
+                              'token': app.config['PROOVL_TOKEN'],
+                              'route': tariff,
+                              'from': _from,
+                              'to': to,
+                              'text': text})
+    if 200 <= r.status_code <= 299:
+        x = r.text.split(";")
+        message_id = x[1].replace('"', '')
+        status = x[0].replace('"', '')
+    else:
+        status = 'Error'
+        message_id = r.reason
+    return status, message_id
+
+
+@app.route(app.config['APPLICATION_ROOT'] + 'incoming_sms', methods=['POST'])
+def proovl_webhook():
+    token = request.values.get('token')
+    _from = request.values.get('from')
+    _id = request.values.get('id')
+    to = request.values.get('to')
+    text = request.values.get('text')
+    status = request.values.get('status')
+    print(token, _from, _id, to, text, status)
+    if status:
+        if _id in app.bot_persistence.state['sms'] \
+                and app.bot_persistence.state['sms'][_id]['to'] in \
+                app.bot_persistence.state['phones'][app.bot_persistence.state['sms'][_id]['from']]['chats']:
+            app.bot.edit_message_text(
+                chat_id=app.bot_persistence.state['sms'][_id]['chat_id'],
+                message_id=app.bot_persistence.state['sms'][_id]['message_id'],
+                text='Сообщение *{0}* доставлено со статусом *{1}*'.format(_id, status),
+                parse_mode=telegram.ParseMode.MARKDOWN
+            )
+            app.bot_persistence.state['sms'][_id]['status'] = status
+            app.bot_persistence.state['sms'][_id]['timestamp'] = int(time.time())
+            if status != 'Delivered' and app.bot_persistence.state['sms'][_id]['tariff'] == 2:
+                sms = copy.copy(app.bot_persistence.state['sms'][_id])
+                res = app.bot.send_message(chat_id=app.bot_persistence.state['sms'][_id]['chat_id'],
+                                           text="Отравка сообщения \"*{0}*\" провалилась со статусом *{1}*.\nПробую отправить с более дорогим тарифом".format(sms['text'], SMS_STATUS_RU.get(status, status)),
+                                           parse_mode=telegram.ParseMode.MARKDOWN)
+                app.bot_persistence.state['sms'].pop(_id, None)
+                sms['tariff'] = 1
+                app.bot_persistence.state['phones'][sms['from']]['chats'][sms['to']]['tariff'] = 1
+                status, message_id = send_sms(sms['from'], sms['to'], sms['text'], 1)
+                res = app.bot.send_message(chat_id=sms['chat_id'], reply_to_message_id=res.message_id,
+                                           text='Сообщение *{0}* отправлено со статусом *{1}*'.format(message_id, SMS_STATUS_RU.get(status, status)),
+                                           parse_mode=telegram.ParseMode.MARKDOWN)
+                sms['message_id'] = res.message_id
+                sms['remote_id'] = message_id
+                sms['status'] = status
+                app.bot_persistence.state['sms'][message_id] = sms
+            app.bot_persistence.update_state(app.bot_persistence.state)
+        else:
+            print('Unknown message ID {0} updated with state {1}'.format(_id, status))
+    else:
+        init_state()
+        init_receiver(to)
+        translation = app.translator.translate(text, dest='ru')
+        if translation.text != text:
+            text += "\nПеревод (c *{0}* на ru): *{1}*".format(translation.src,
+                                                              translation.text)
+        else:
+            text = '*{0}*'.format(text)
+        if _from not in app.bot_persistence.state['phones'][to]['chats']:
+            app.bot_persistence.state['phones'][to]['chats'][_from] = {
+                'last_message': int(time.time()),
+                'tariff': app.config['PROOVL_TARIFF'],
+                'incoming': 1,
+                'message': text,
+            }
+            users = set([str(app.bot_persistence.state['self']),
+                         str(app.bot_persistence.state['bot_id'])])
+            for user_id in app.bot_persistence.state['operators'].keys():
+                users.add(str(user_id))
+            tgcli_send_command('create_group_chat \'{0} → {1}\' user#{2}'.
+                               format(_from, to, ' user#'.join(users)))
+        else:
+            app.bot_persistence.state['phones'][to]['chats'][_from]['last_message'] = int(time.time())
+            app.bot_persistence.state['phones'][to]['chats'][_from].pop('try', None)
+            if 'incoming' in app.bot_persistence.state['phones'][to]['chats'][_from]:
+                app.bot_persistence.state['phones'][to]['chats'][_from]['incoming'] += 1
+            else:
+                app.bot_persistence.state['phones'][to]['chats'][_from]['incoming'] = 1
+            app.bot.send_message(chat_id=app.bot_persistence.state['phones'][to]['chats'][_from]['chat_id'],
+                                 text=text, parse_mode=telegram.ParseMode.MARKDOWN)
+    return 'OK'
+
+
+@app.route(app.config['APPLICATION_ROOT'] + app.config['TELEGRAM_TOKEN'],
+           methods=['POST'])
+def telegram_webhook():
+    payload = request.get_json(force=True)
+    print(payload)
+    update = telegram.update.Update.de_json(payload, app.bot)
+    app.dispatcher.process_update(update)
+    return 'OK'
+
+
+def save_state(context, new_state):
+    context.chat_data['state'] = new_state
+    return new_state
+
+
+def menu_keyboard(context):
+    back = telegram.InlineKeyboardButton('🔙 Назад', callback_data='Назад')
+    if 'state' not in context.chat_data or \
+            context.chat_data['state'] in [CONFIG, PASSWORD]:
+        back = telegram.InlineKeyboardButton('🚪 Выход', callback_data='Выход')
+    return telegram.InlineKeyboardMarkup([
+        [telegram.InlineKeyboardButton('💰 Баланс', callback_data='Баланс'),
+         telegram.InlineKeyboardButton('📞 Номера телефонов',
+                                       callback_data='Номера телефонов')],
+        [telegram.InlineKeyboardButton('Администраторы',
+                                       callback_data='Администраторы'),
+         telegram.InlineKeyboardButton('Операторы',
+                                       callback_data='Операторы')],
+        [back]])
+
+
+def init_state():
+    if not app.bot_persistence.state:
+        me = app.bot.get_me()
+        payload = tgcli_send_command('get_self')
+        root = {
+            'id': payload['peer_id'],
+            'name': payload['print_name'],
+            'username': payload['username']
+        }
+        state = {
+            'phones': {},
+            'sms': {},
+            'admins': {
+                payload['peer_id']: root,
+            },
+            'operators': {
+                payload['peer_id']: root,
+            },
+            'self': payload['peer_id'],
+            'bot_id': me.id,
+        }
+        app.bot_persistence.update_state(state)
+
+
+def start(update, context):
+    init_state()
+    user = update.message.from_user
+    if user.id in app.bot_persistence.state['admins']:
+        update.message.reply_text('{0}, снова привет!'.format(user.first_name),
+                                  reply_markup=menu_keyboard(context))
+        return save_state(context, CONFIG)
+    update.message.reply_text('Впервые вижу')
+    return save_state(context, PASSWORD)
+
+
+def handle_password(update, context):
+    if update.message.text == app.config['BOT_PASSWORD']:
+        app.bot.deleteMessage(chat_id=update.message.chat.id,
+                              message_id=update.message.message_id)
+        user = update.message.from_user
+        app.bot_persistence.state['admins'][user.id] = {
+            'id': user.id,
+            'name': user.first_name,
+            'username': user.username
+        }
+        app.bot_persistence.update_state(app.bot_persistence.state)
+        update.message.reply_text('Привет, {0}'.format(user.first_name),
+                                  reply_markup=menu_keyboard(context))
+        return save_state(context, CONFIG)
+    else:
+        update.message.reply_text('Пока!',
+                                  reply_markup=telegram.ReplyKeyboardRemove())
+    return ConversationHandler.END
+
+
+def handle_cancel(update, context):
+    update.callback_query.message.reply_text('Береги себя!',
+                              reply_markup=telegram.ReplyKeyboardRemove())
+    return ConversationHandler.END
+
+
+def handle_cancel_query(update, context):
+    update.callback_query.message.reply_text('Береги себя!',
+                                             reply_markup=telegram.ReplyKeyboardRemove())
+    return ConversationHandler.END
+
+
+def handle_balance(update, context):
+    r = requests.get('https://www.proovl.com/api/balance.php',
+                     params={'user': app.config['PROOVL_USER'],
+                             'token': app.config['PROOVL_TOKEN']})
+    update.callback_query.message.reply_text('Баланс: {0}'.format(r.text),
+                              reply_markup=menu_keyboard(context))
+    return save_state(context, CONFIG)
+
+
+def handle_back(update, context):
+    if context.chat_data['state'] == CONFIG:
+        return handle_cancel(update, context)
+    if context.chat_data['state'] == USERS:
+        save_state(context, CONFIG)
+        update.callback_query.message.reply_text('Основное меню',
+                                  reply_markup=menu_keyboard(context))
+        return CONFIG
+    return handle_cancel(update, context)
+
+
+def add_phone_keyboard():
+    button_list = [
+        [telegram.InlineKeyboardButton('➕ Добавить номер', callback_data='Добавить номер')],
+    ]
+    for phone in app.bot_persistence.state['phones']:
+        button_list.append([telegram.InlineKeyboardButton('📝 {0}'.format(phone),
+                                                          callback_data='Изменить {0}'.format(phone)),
+                            telegram.InlineKeyboardButton('❌ {0}'.format(phone),
+                                                          callback_data='Удалить {0}'.format(phone))])
+    button_list.append([telegram.InlineKeyboardButton('🔙 Назад',
+                                                      callback_data='Назад'),
+                        telegram.InlineKeyboardButton('🚪 Выход',
+                                                      callback_data='Выход')])
+    return telegram.InlineKeyboardMarkup(button_list)
+
+
+
+def handle_back_query(update, context):
+    if context.chat_data['state'] == PHONES_MENU:
+        save_state(context, CONFIG)
+        update.callback_query.message.reply_text('Основное меню',
+                                                 reply_markup=menu_keyboard(context))
+        return CONFIG
+    elif context.chat_data['state'] == PHONE_EDIT:
+        update.callback_query.message.reply_text('Редактирование номеров телефонов',
+                                                 reply_markup=add_phone_keyboard())
+        return save_state(context, PHONES_MENU)
+    return handle_cancel(update, context)
+
+
+def user_keyboard(context):
+    if context.chat_data['user_type'] == 'Администраторы':
+        add_user_menu = '➕ Добавить администратора'
+        state_field = 'admins'
+    else:
+        add_user_menu = '➕ Добавить оператора'
+        state_field = 'operators'
+    menu = [[telegram.InlineKeyboardButton(add_user_menu,
+                                           callback_data=add_user_menu)]]
+    for user in app.bot_persistence.state[state_field]:
+        button = 'Удалить ' + \
+                 app.bot_persistence.state[state_field][user]['name']
+        menu.append([telegram.InlineKeyboardButton('❌ ' + button,
+                                           callback_data=button)])
+    menu.append([telegram.InlineKeyboardButton('🔙 Назад',
+                                               callback_data='Назад'),
+                 telegram.InlineKeyboardButton('🚪 Выход',
+                                               callback_data='Выход')])
+    return telegram.InlineKeyboardMarkup(menu)
+
+
+def handle_users(update, context):
+    context.chat_data['user_type'] = update.callback_query.data
+    if context.chat_data['user_type'] == 'Администраторы':
+        reply = 'Управление администраторами'
+    else:
+        reply = 'Управление операторами'
+    update.callback_query.message.reply_text(reply, reply_markup=user_keyboard(context))
+    return save_state(context, USERS)
+
+
+def handle_add_user(update, context):
+    if context.chat_data['user_type'] == 'Администраторы':
+        reply = 'Введите ник нового администратора, например: @shishkova'
+    else:
+        reply = 'Введите ник нового оператора, например: @timati'
+    update.callback_query.message.reply_text(reply,
+                                             reply_markup=telegram.ReplyKeyboardRemove())
+    return save_state(context, NEW_USER)
+
+
+def handle_set_user(update, context):
+    if context.chat_data['user_type'] == 'Администраторы':
+        user_type = 'администратор'
+        state_field = 'admins'
+    else:
+        user_type = 'оператор'
+        state_field = 'operators'
+    nick = update.message.text
+    payload = tgcli_send_command('resolve_username {0}'.
+                                 format(nick.lstrip('@')))
+    if 'result' in payload:
+        result = 'Пользователь с ником {0} не найден'.format(nick)
+    else:
+        if payload['peer_id'] in app.bot_persistence.state[state_field]:
+            result = 'Пользователь с ником {0} уже {1}'.format(nick, user_type)
+        else:
+            user = {
+                'id': payload['peer_id'],
+                'name': payload['print_name'],
+                'username': payload['username']
+            }
+            app.bot_persistence.state[state_field][payload['peer_id']] = user
+            result = 'Пользователь с ником {0} теперь {1}!'.format(nick,
+                                                                   user_type)
+            app.bot_persistence.update_state(app.bot_persistence.state)
+    update.message.reply_text(result, reply_markup=user_keyboard(context))
+    return save_state(context, USERS)
+
+
+def find_user_by_field(group, field, value):
+    for user_id in app.bot_persistence.state[group]:
+        if app.bot_persistence.state[group][user_id][field] == value:
+            return user_id
+    return None
+
+
+def handle_del_user(update, context):
+    if context.chat_data['user_type'] == 'Администраторы':
+        user_type = 'администратор'
+        state_field = 'admins'
+    else:
+        user_type = 'оператор'
+        state_field = 'operators'
+    nick = context.matches[0].group(1)
+    user_id = find_user_by_field(state_field, 'name', nick)
+    if app.bot_persistence.state['self'] == user_id:
+        result = 'Нельзя удалить основного {0}а'.format(user_type)
+    else:
+        app.bot_persistence.state[state_field].pop(user_id, None)
+        app.bot_persistence.update_state(app.bot_persistence.state)
+        result = '{0} больше не {1}!'.format(nick, user_type)
+    update.callback_query.message.reply_text(result, reply_markup=user_keyboard(context))
+    return save_state(context, USERS)
+
+
+def handle_phones(update, context):
+    reply = 'Редактирование номеров телефонов'
+    update.callback_query.message.reply_text(reply, reply_markup=add_phone_keyboard())
+    return save_state(context, PHONES_MENU)
+
+
+def handle_chat_start(update, context):
+    init_state()
+    context.chat_data['chat_id'] = update.message.chat.id
+    chat = app.bot.get_chat(context.chat_data['chat_id'])
+    title = chat.description or update.message.chat.title
+    if not chat.description:
+        app.bot.set_chat_description(context.chat_data['chat_id'],
+                                     update.message.chat.title)
+    context.chat_data['sender'] = title.split(' ')[0]
+    context.chat_data['receiver'] = title.split(' ')[-1]
+    init_receiver(context.chat_data['receiver'])
+    if context.chat_data['sender'] in \
+            app.bot_persistence.state['phones'][context.chat_data['receiver']]['regulars']:
+        app.bot_persistence.state['phones'][context.chat_data['receiver']]['regulars'][context.chat_data['sender']] += 1
+    else:
+        app.bot_persistence.state['phones'][context.chat_data['receiver']]['regulars'][context.chat_data['sender']] = 1
+    if context.chat_data['sender'] not in \
+            app.bot_persistence.state['phones'][context.chat_data['receiver']]['chats']:
+        app.bot_persistence.state['phones'][context.chat_data[
+            'receiver']]['chats'][context.chat_data['sender']] = {}
+    app.bot_persistence.state['phones'][context.chat_data[
+        'receiver']]['chats'][context.chat_data['sender']].update({
+        'chat_id': context.chat_data['chat_id'],
+        'sender': context.chat_data['sender'],
+        'receiver': context.chat_data['receiver'],
+        'last_message': int(time.time()),
+        'tariff': app.config['PROOVL_TARIFF'],
+    })
+    app.bot_persistence.update_state(app.bot_persistence.state)
+    text = 'Абоненту: *{0}*'.format(context.chat_data['receiver'])
+    if app.bot_persistence.state['phones'][context.chat_data['receiver']]['nick'] != context.chat_data['receiver']:
+        app.bot.set_chat_title(context.chat_data['chat_id'],
+                               '{0} → {1}'.format(context.chat_data['sender'],
+                                                  app.bot_persistence.state['phones'][context.chat_data['receiver']]['nick']))
+        text = "На телефон: *{0}*\nАбоненту: *{1}*".format(context.chat_data['receiver'], app.bot_persistence.state['phones'][context.chat_data['receiver']]['nick'])
+    if app.bot_persistence.state['phones'][context.chat_data['receiver']]['site']:
+        text += "\nСайт: {0}".format(app.bot_persistence.state['phones'][context.chat_data['receiver']]['site'])
+    res = app.bot.send_message(chat_id=context.chat_data['chat_id'], text=text)
+    app.bot.pin_chat_message(context.chat_data['chat_id'], res.message_id,
+                             disable_notification=True)
+    text = 'Пишет: *{0}*'.format(context.chat_data['sender'])
+    if len(app.bot_persistence.state['phones'][context.chat_data['receiver']]['replies']):
+        text += "\nБыстрые ответы:"
+        for reply in app.bot_persistence.state['phones'][context.chat_data['receiver']]['replies']:
+            if app.bot_persistence.state['phones'][context.chat_data['receiver']]['replies'][reply]:
+                text += "\n*{0}*: {1}".format(reply,
+                                              app.bot_persistence.state['phones'][context.chat_data['receiver']]['replies'][reply])
+    app.bot.send_message(chat_id=context.chat_data['chat_id'], text=text)
+    if 'message' in app.bot_persistence.state['phones'][context.chat_data['receiver']]['chats'][context.chat_data['sender']]:
+        app.bot.send_message(chat_id=context.chat_data['chat_id'],
+                             parse_mode=telegram.ParseMode.MARKDOWN,
+                             text=app.bot_persistence.state['phones'][context.chat_data['receiver']]['chats'][context.chat_data['sender']]['message'])
+        app.bot_persistence.state['phones'][context.chat_data['receiver']]['chats'][context.chat_data['sender']].pop('message', None)
+    return save_state(context, SMS)
+
+
+def handle_chat_stop(update, context):
+    #app.bot_persistence.state['phones'][context.chat_data[
+    #    'receiver']]['chats'].pop(context.chat_data['sender'], None)
+    #app.bot_persistence.update_state(app.bot_persistence.state)
+    return ConversationHandler.END
+
+
+@app.route(app.config['APPLICATION_ROOT'] + 'send.php', methods=['POST'])
+def fake_send_sms():
+    token = request.values.get('token')
+    from_ = request.values.get('from')
+    id_ = request.values.get('id')
+    to = request.values.get('to')
+    text = request.values.get('text')
+    status = request.values.get('status')
+    #return 'Sent;' + text
+    return 'Sent;1'
+    return 'Error;Проверка ошибки'
+
+
+def real_handle_sms(message, context):
+    tariff = app.bot_persistence.state['phones'][context.chat_data['receiver']]['chats'][context.chat_data['sender']]['tariff']
+    sms = {
+        'reply_to_message': message.message_id,
+        'text': message.text,
+        'from': context.chat_data['receiver'],
+        'to': context.chat_data['sender'],
+        'chat_id': context.chat_data['chat_id'],
+        'tariff': tariff,
+        'timestamp': int(time.time()),
+    }
+    app.bot_persistence.state['phones'][context.chat_data['receiver']]['chats'][context.chat_data['sender']]['last_message'] = int(time.time())
+    app.bot_persistence.state['phones'][context.chat_data['receiver']]['chats'][context.chat_data['sender']].pop('try', None)
+    status, message_id = send_sms(context.chat_data['receiver'],
+                                  context.chat_data['sender'],
+                                  message.text, tariff)
+    if status == 'Error':
+        message.reply_text('Ошибка при отправке сообщения: {0}'.format(message_id))
+    else:
+        res = message.reply_text('Сообщение *{0}* отправлено со статусом *{1}*'.format(message_id, SMS_STATUS_RU.get(status, status)),
+                                 parse_mode=telegram.ParseMode.MARKDOWN)
+        sms['remote_id'] = message_id
+        sms['status'] = status
+        sms['message_id'] = res.message_id
+        sms['reply_to_message_id'] = message.message_id
+        app.bot_persistence.state['sms'][message_id] = sms
+        app.bot_persistence.update_state(app.bot_persistence.state)
+    print('state:')
+    print(app.bot_persistence.state)
+    return SMS
+
+
+def handle_send_translate_query(update, context):
+    return real_handle_sms(update.callback_query.message, context)
+
+
+def handle_add_phone_query(update, context):
+    update.callback_query.message.reply_text('Введи новый номер телефона (например, 33666555777):',
+                                             reply_markup=telegram.ReplyKeyboardRemove())
+    return save_state(context, NEW_PHONE)
+
+
+def handle_del_phone_query(update, context):
+    phone = context.matches[0].group(1)
+    app.bot_persistence.state['phones'].pop(phone, None)
+    # TODO: exit from all chats!!!
+    reply = 'Редактирование номеров телефонов'
+    update.callback_query.message.reply_text(reply, reply_markup=add_phone_keyboard())
+    return save_state(context, PHONES_MENU)
+
+
+def handle_add_quick_reply_name_query(update, context):
+    update.callback_query.message.reply_text('Ввведи название быстрого ответа (например, 🗺 address, 💶 price, 🔑 intercom):',
+                                             reply_markup=telegram.ReplyKeyboardRemove())
+    return save_state(context, NEW_REPLY)
+
+
+def handle_add_quick_reply(update, context):
+    text = update.message.text
+    phone = context.chat_data['phone']
+    if text in app.bot_persistence.state['phones'][phone].keys():
+        update.message.reply_text('Это слово зарезервировано, попробуй другое')
+        return save_state(context, NEW_REPLY)
+    context.chat_data['reply'] = text
+    update.message.reply_text('Введи быстрый ответ для {0}:'.format(text),
+                              reply_markup=telegram.ReplyKeyboardRemove())
+    return save_state(context, SET_PHONE_PROPERTY)
+
+
+def edit_phone_keyboard(phone):
+    button_list = [
+        [telegram.InlineKeyboardButton('📝 псевдоним',
+                                       callback_data='Изменить nick'),
+         telegram.InlineKeyboardButton('📝 сайт',
+                                       callback_data='Изменить site')],
+        [telegram.InlineKeyboardButton('➕ Добавить быстрый ответ', callback_data='Добавить быстрый ответ')],
+    ]
+    for reply in app.bot_persistence.state['phones'][phone]['replies']:
+        button_list.append([telegram.InlineKeyboardButton('📝 {0}'.format(reply),
+                                                          callback_data='Изменить {0}'.format(reply)),
+                            telegram.InlineKeyboardButton('❌ {0}'.format(reply),
+                                                          callback_data='Забыть {0}'.format(reply))])
+    button_list.append([telegram.InlineKeyboardButton('🔙 Назад',
+                                                      callback_data='Назад'),
+                        telegram.InlineKeyboardButton('🚪 Выход',
+                                                      callback_data='Выход')])
+    return telegram.InlineKeyboardMarkup(button_list)
+
+
+def edit_phone_reply(phone):
+    nick = app.bot_persistence.state['phones'][phone]['nick']
+    site = app.bot_persistence.state['phones'][phone]['site']
+    replies = app.bot_persistence.state['phones'][phone]['replies']
+    text = "редактирование номера *{0}*\n"\
+            "Псевдоним: *{1}*\n"\
+            "Сайт: *{2}*".format(phone, nick, site)
+    if len(replies):
+        text += "\nБыстрые ответы:"
+        for reply in replies:
+            text += "\n*{0}*: {1}".format(reply, replies[reply])
+    return text
+
+
+def handle_add_phone(update, context):
+    phone = update.message.text.lstrip('+')
+    init_receiver(phone)
+    context.chat_data['phone'] = phone
+    update.message.reply_text(edit_phone_reply(phone),
+                              parse_mode=telegram.ParseMode.MARKDOWN,
+                              reply_markup=edit_phone_keyboard(phone))
+    return save_state(context, PHONE_EDIT)
+
+
+def handle_edit_phone_property_query(update, context):
+    reply = context.matches[0].group(1)
+    context.chat_data['reply'] = reply
+    property_ru = {
+        'site': 'сайт',
+        'nick': 'псевдоним',
+    }
+    reply = property_ru.get(reply, reply)
+    update.callback_query.message.reply_text('Введи новый *{0}*:'.format(reply),
+                                             parse_mode=telegram.ParseMode.MARKDOWN,
+                                             reply_markup=telegram.ReplyKeyboardRemove())
+    return save_state(context, SET_PHONE_PROPERTY)
+
+
+def handle_delete_phone_property_query(update, context):
+    reply = context.matches[0].group(1)
+    phone = context.chat_data['phone']
+    app.bot_persistence.state['phones'][phone]['replies'].pop(reply, None)
+    app.bot_persistence.update_state(app.bot_persistence.state)
+    update.callback_query.message.reply_text(edit_phone_reply(phone),
+                                             parse_mode=telegram.ParseMode.MARKDOWN,
+                                             reply_markup=edit_phone_keyboard(phone))
+    return save_state(context, PHONE_EDIT)
+
+
+def handle_set_phone_property(update, context):
+    text = update.message.text
+    phone = context.chat_data['phone']
+    reply = context.chat_data['reply']
+    if reply in ['site', 'nick']:
+        app.bot_persistence.state['phones'][phone][reply] = text
+    else:
+        app.bot_persistence.state['phones'][phone]['replies'][reply] = text
+    app.bot_persistence.update_state(app.bot_persistence.state)
+    update.message.reply_text(edit_phone_reply(phone),
+                              parse_mode=telegram.ParseMode.MARKDOWN,
+                              reply_markup=edit_phone_keyboard(phone))
+    return save_state(context, PHONE_EDIT)
+
+
+def handle_edit_phone_query(update, context):
+    phone = context.matches[0].group(1)
+    context.chat_data['phone'] = phone
+    update.callback_query.message.reply_text(edit_phone_reply(phone),
+                                             parse_mode=telegram.ParseMode.MARKDOWN,
+                                             reply_markup=edit_phone_keyboard(phone))
+    return save_state(context, PHONE_EDIT)
+
+
+def handle_translate(update, context):
+    dest, text = update.message.text.split(' ', 1)
+    dest = dest.lstrip('/')
+    translation = app.translator.translate(text, src='ru', dest=dest)
+    keyboard = None
+    if translation.text != text:
+        text = '*{1}*'.format(translation.dest, translation.text)
+        keyboard = telegram.InlineKeyboardMarkup([[telegram.InlineKeyboardButton('Отправить',
+                                                                               callback_data='Отправить')]])
+    else:
+        text = 'Перевод такой же!'
+    update.message.reply_text(text, parse_mode=telegram.ParseMode.MARKDOWN,
+                              reply_markup=keyboard)
+    return SMS
+
+
+def handle_sms(update, context):
+    return real_handle_sms(update.message, context)
+
+
+def handle_human_init(update, context):
+    text = update.message.text.lstrip('/set').split(' ', 1)
+    app.bot.deleteMessage(chat_id=update.message.chat.id,
+                          message_id=update.message.message_id)
+    # app.human.ready_send(text[0], text[1])
+    return ConversationHandler.END
+
+
+def handle_error(update, context):
+    trace = "".join(traceback.format_tb(sys.exc_info()[2]))
+    payload = ""
+    if update.effective_user:
+        payload += f' с пользователем @{update.effective_user.username}'
+    if update.effective_chat:
+        payload += f' в чате *{update.effective_chat.title}*'
+        if update.effective_chat.username:
+            payload += f' (@{update.effective_chat.username})'
+    if update.poll:
+        payload += f' с poll id {update.poll.id}.'
+    text = f"Эй!\nОшибка *{context.error}* случилась{payload}. полный traceback:\n\n```{trace}```"
+    print(text)
+    app.bot.send_message(chat_id=app.config['TELEGRAM_DEVELOPER'], text=text,
+                         parse_mode=telegram.ParseMode.MARKDOWN)
+
+
+if __name__ == "__main__":
+    conv_handler = ConversationHandler(
+        entry_points=[CommandHandler('start', start)],
+        states={
+            PASSWORD: [MessageHandler(Filters.text, handle_password)],
+            CONFIG: [CallbackQueryHandler(handle_balance,
+                                          pattern='^(Баланс)$'),
+                     CallbackQueryHandler(handle_back,
+                                          pattern='^(Назад|Выход)$'),
+                     CallbackQueryHandler(handle_users,
+                                          pattern='^(Администраторы)$'),
+                     CallbackQueryHandler(handle_users,
+                                          pattern='^(Операторы)$'),
+                     CallbackQueryHandler(handle_phones,
+                                          pattern='^(Номера телефонов)$')],
+            USERS: [CallbackQueryHandler(handle_add_user,
+                                         pattern='^Добавить (оператора|администратора)$'),
+                    CallbackQueryHandler(handle_back, pattern='^(Назад)$'),
+                    CallbackQueryHandler(handle_cancel, pattern='^(Выход)$'),
+                    CallbackQueryHandler(handle_del_user,
+                                         pattern='^Удалить (.+)$')],
+            NEW_USER: [MessageHandler(Filters.text, handle_set_user)],
+            PHONES_MENU: [CallbackQueryHandler(handle_back_query, pattern='^(Назад)$'),
+                          CallbackQueryHandler(handle_cancel_query, pattern='^(Выход)$'),
+                          CallbackQueryHandler(handle_add_phone_query, pattern='^(Добавить номер)$'),
+                          CallbackQueryHandler(handle_edit_phone_query, pattern='^Изменить (\d+)$'),
+                          CallbackQueryHandler(handle_del_phone_query, pattern='^Удалить (\d+)$')
+                          ],
+            NEW_PHONE: [MessageHandler(Filters.text, handle_add_phone)],
+            NEW_REPLY: [MessageHandler(Filters.text, handle_add_quick_reply)],
+            SET_PHONE_PROPERTY: [MessageHandler(Filters.text, handle_set_phone_property)],
+            PHONE_EDIT: [CallbackQueryHandler(handle_edit_phone_property_query, pattern='^Изменить (.+)$'),
+                         CallbackQueryHandler(handle_delete_phone_property_query, pattern='^Забыть (.+)$'),
+                         CallbackQueryHandler(handle_add_quick_reply_name_query, pattern='^(Добавить быстрый ответ)$'),
+                         CallbackQueryHandler(handle_back_query, pattern='^(Назад)$'),
+                         CallbackQueryHandler(handle_cancel_query, pattern='^(Выход)$')]
+        },
+        fallbacks=[CommandHandler('cancel', handle_cancel)]
+    )
+    sms_handler = ConversationHandler(
+        entry_points=[MessageHandler(Filters.status_update.chat_created | Filters.status_update.new_chat_members, handle_chat_start),
+                      CommandHandler('help', handle_chat_start)],
+        states={
+            SMS: [MessageHandler(Filters.text, handle_sms),
+                  CallbackQueryHandler(handle_send_translate_query,
+                                       pattern='^(Отправить)$'),
+                  CommandHandler(['fr', 'en', 'de'], handle_translate)],
+        },
+        fallbacks=[MessageHandler(Filters.status_update.left_chat_member, handle_chat_stop)]
+    )
+    app.dispatcher.add_handler(CommandHandler('setcode', handle_human_init))
+    app.dispatcher.add_handler(CommandHandler('setpassword', handle_human_init))
+    app.dispatcher.add_handler(conv_handler)
+    app.dispatcher.add_handler(sms_handler)
+    app.dispatcher.add_error_handler(handle_error)
+    scheduler.init_app(app)
+    scheduler.start()
+    app.run(host=app.config['FLASK_RUN_HOST'],
+            port=app.config['FLASK_RUN_PORT'])

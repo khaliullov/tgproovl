@@ -1,0 +1,16 @@
+.PHONY: deps
+deps:
+	apt-get update
+	apt-get upgrade
+	pip install --upgrade pip
+	pip install virtualenv
+	apt-get install make git zlib1g-dev libssl-dev gperf php cmake clang \
+		libc++-dev libc++abi-dev
+	git clone https://github.com/tdlib/td.git /tmp/td
+	rm -rf /tmp/td/build
+	mkdir -p /tmp/td/build
+	export CXXFLAGS="-stdlib=libc++"
+	cd /tmp/td/build && CC=/usr/bin/clang CXX=/usr/bin/clang++ cmake -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX:PATH=../tdlib ..
+	cd /tmp/td/build && cmake --build . --target install
+
+test:
