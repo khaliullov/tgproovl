@@ -17,8 +17,6 @@ class MainConfig(object):
     PROOVL_USER = os.environ.get('TGPROOVL_PROOVL_USER', '')
     PROOVL_TOKEN = os.environ.get('TGPROOVL_PROOVL_TOKEN', '')
     PROOVL_TARIFF = int(os.environ.get('TGPROOVL_PROOVL_TARIFFT', 2))
-    TELEGRAM_CLI_HOST = os.environ.get('TGPROOVL_TELEGRAM_CLI_HOST', '127.0.0.1')
-    TELEGRAM_CLI_PORT = int(os.environ.get('TGPROOVL_TELEGRAM_CLI_PORT', 2391))
     TELEGRAM_DEVELOPER = int(os.environ.get('TGPROOVL_TELEGRAM_DEVELOPER', -1))
     TELEGRAM_OWNER = int(os.environ.get('TGPROOVL_TELEGRAM_OWNER', -1))
     TELEGRAM_PHONE = os.environ.get('TGPROOVL_TELEGRAM_PHONE', '')

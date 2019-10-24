@@ -12,5 +12,3 @@ deps:
 	export CXXFLAGS="-stdlib=libc++"
 	cd /tmp/td/build && CC=/usr/bin/clang CXX=/usr/bin/clang++ cmake -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX:PATH=../tdlib ..
 	cd /tmp/td/build && cmake --build . --target install
-
-test:

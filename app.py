@@ -1,11 +1,8 @@
 # -*- coding: utf-8 -*-
 
 import copy
-import json
 import logging
 import os
-import select
-import socket
 import sys
 import time
 import traceback
@@ -45,7 +42,6 @@ app.dispatcher = Dispatcher(bot=app.bot, update_queue=None,
 app.bot.setWebhook(url='https://%s%s%s' % (app.config['SERVER_NAME'],
                                            app.config['APPLICATION_ROOT'],
                                            app.config['TELEGRAM_TOKEN']))
-# app.authorization_state = None
 app.human = TgClient(app.config['TELEGRAM_API_ID'],
                      app.config['TELEGRAM_API_HASH'],
                      use_message_database=False, tdlib_verbosity=2,
@@ -61,50 +57,8 @@ def smoke_test():
     return 'OK'
 
 
-def tgcli_send_command(cmd):
-    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    server_address = (app.config['TELEGRAM_CLI_HOST'],
-                      app.config['TELEGRAM_CLI_PORT'])
-    sock.connect(server_address)
-    try:
-        message = cmd + '\n'
-        sock.sendall(message.encode('utf-8'))
-        sock.setblocking(0)
-        data = []
-        b = b' '
-        while '\n' not in b.decode():
-            ready = select.select([sock], [], [], 5)
-            if ready[0]:
-                b = sock.recv(16)
-            else:
-                return {'result': 'FAIL'}
-            data.append(b)
-        data = "".join([x.decode('utf-8') for x in data])
-        data = data.replace("ANSWER", "")
-        amount_expected = int(data.split('\n')[0].strip())
-        amount_received = 16 - (len("ANSWER") + 1 +
-                                len(str(amount_expected)) + 1)
-        res = data.split('\n')[1].encode('utf-8')
-        while amount_received < amount_expected:
-            data = sock.recv(16)
-            amount_received += len(data)
-            res += data
-        res = res.decode()
-    except Exception as exc:
-        app.bot.send_message(chat_id=app.config['TELEGRAM_DEVELOPER'],
-                             text='Exception while sending *{0}*: *{1}*'.format(
-                                 cmd, str(exc)),
-                             parse_mode=telegram.ParseMode.MARKDOWN)
-        return {'result': 'FAIL'}
-    finally:
-        sock.close()
-    return json.loads(res)
-
-
 @scheduler.task('interval', id='get_sms', seconds=10, coalesce=False)
 def check_sms_and_chats():
-    # if app.human and not app.human._authorized:
-    #    app.human.login_async()
     now = int(time.time())
     if not app.bot_persistence.state \
             or 'phones' not in app.bot_persistence.state \
@@ -117,6 +71,8 @@ def check_sms_and_chats():
         for sender in app.bot_persistence.state['phones'][receiver]['chats']:
             chat = app.bot_persistence.state['phones'][receiver]['chats'][
                 sender]
+            if 'try' in chat and chat['try'] > 3:
+                to_remove.append(sender)
             if chat['last_message'] + app.config['CHAT_HALF_TIMEOUT'] < now:
                 if 'try' not in chat:
                     chat['try'] = 1
@@ -130,17 +86,40 @@ def check_sms_and_chats():
                         to_remove.append(sender)
                     continue
             if chat['last_message'] + app.config['CHAT_HALF_TIMEOUT'] * 2 < now:
-                users = set([str(app.bot_persistence.state['bot_id'])])
-                for user_id in app.bot_persistence.state['operators'].keys():
-                    users.add(str(user_id))
-                users.discard(str(app.bot_persistence.state['self']))
-                users.add(str(app.bot_persistence.state['self']))
-                for user in users:
-                    result = tgcli_send_command('chat_del_user chat#{0} user#{1}'.
-                                                format(abs(chat['chat_id']), user))
-                    if 'result' in result:
-                        continue
-                to_remove.append(sender)
+                result = app.human._send_data({'@type': 'searchChatMembers',
+                                               'limit': 100,
+                                               'chat_id': chat['chat_id']})
+                try:
+                    result.wait(timeout=5)
+                except TimeoutError:
+                    chat['try'] += 1
+                    continue
+                if result.update and result.update.ID == 'chatMembers':
+                    users = set()
+                    for member in result.update.members:
+                        users.add(member.user_id)
+                    users.discard(app.bot_persistence.state['self'])
+                    users.add(app.bot_persistence.state['self'])
+                    error = False
+                    for user_id in users:
+                        result = app.human._send_data({
+                            '@type': 'setChatMemberStatus',
+                            'user_id': user_id,
+                            'chat_id': chat['chat_id'],
+                            'status': {'@type': 'chatMemberStatusLeft'}})
+                        try:
+                            result.wait(timeout=5)
+                        except TimeoutError:
+                            pass
+                        if not result.update:
+                            error = True
+                            break
+                    if not error:
+                        to_remove.append(sender)
+                    else:
+                        chat['try'] += 1
+                else:
+                    chat['try'] += 1
         for item in to_remove:
             app.bot_persistence.state['phones'][receiver]['chats'].pop(item, None)
     to_remove = []
@@ -272,23 +251,36 @@ def proovl_webhook():
             text = '*{0}*'.format(esc_yml(text))
         if _from not in app.bot_persistence.state['phones'][to]['chats']:
             users = set([app.bot_persistence.state['bot_id']])
+            nicks = set([app.bot_persistence.state['bot_username']])
             for user_id in app.bot_persistence.state['operators'].keys():
+                nicks.add(app.bot_persistence.state['operators'][user_id]['username'])
                 users.add(user_id)
             users.discard(app.bot_persistence.state['self'])
             user_ids = [app.bot_persistence.state['self']]
             user_ids.extend(users)
-            result = app.human._send_data({'@type': 'searchPublicChat',
-                                           'username': '@{0}'.format(app.bot_persistence.state['bot_username'])})
-            result.wait()
+            for nick in nicks:
+                result = app.human._send_data({'@type': 'searchPublicChat',
+                                               'username': '@{0}'.format(nick)})
+                try:
+                    result.wait(timeout=5)
+                except TimeoutError:
+                    pass
             for user in user_ids:
                 result = app.human._send_data({'@type': 'getUser',
                                                'user_id': user})
-                result.wait()
+                try:
+                    result.wait(timeout=5)
+                except TimeoutError:
+                    pass
+            title = '{0} → {1}'.format(_from, to)
             result = app.human._send_data({'@type': 'createNewBasicGroupChat',
-                                           'title': '{0} → {1}'.format(_from, to),
+                                           'title': title,
                                            'user_ids': user_ids})
-            result.wait()
-            if result.update['@type'] == 'chat':
+            try:
+                result.wait(timeout=5)
+            except TimeoutError:
+                pass
+            if result.update and result.update['@type'] == 'chat':
                 app.bot_persistence.state['phones'][to]['chats'][_from] = {
                     'last_message': int(time.time()),
                     'tariff': app.config['PROOVL_TARIFF'],
@@ -296,6 +288,9 @@ def proovl_webhook():
                     'message': text,
                 }
                 app.bot_persistence.state['phones'][to]['chats'][_from]['chat_id'] = result.update['id']
+                app.human._send_data({'@type': 'setChatDescription',
+                                      'chat_id': result.update['id'],
+                                      'description': title})
             else:
                 app.bot.send_message(chat_id=app.config['TELEGRAM_DEVELOPER'],
                                      text="Ошибка создания канала!\n"
@@ -519,8 +514,11 @@ def handle_set_user(update, context):
     nick = update.message.text
     result = app.human._send_data({'@type': 'searchPublicChat',
                                    'username': nick})
-    result.wait()
-    if result.update['@type'] != 'chat':
+    try:
+        result.wait(timeout=5)
+    except TimeoutError:
+        pass
+    if not result.update or result.update['@type'] != 'chat':
         result = 'Пользователь с ником {0} не найден'.format(nick)
     else:
         user = {
@@ -575,7 +573,8 @@ def handle_phones(update, context):
 def handle_chat_start(update, context):
     init_state()
     context.chat_data['chat_id'] = update.message.chat.id
-    title = update.message.chat.title
+    chat = app.bot.get_chat(context.chat_data['chat_id'])
+    title = chat.description or update.message.chat.title
     context.chat_data['sender'] = title.split(' ')[0]
     context.chat_data['receiver'] = title.split(' ')[-1]
     init_receiver(context.chat_data['receiver'])
@@ -599,19 +598,17 @@ def handle_chat_start(update, context):
     app.bot_persistence.update_state(app.bot_persistence.state)
     text = 'Абоненту: *{0}*'.format(esc_yml(context.chat_data['receiver']))
     if app.bot_persistence.state['phones'][context.chat_data['receiver']]['nick'] != context.chat_data['receiver']:
-        #app.bot.set_chat_title(context.chat_data['chat_id'],
-        #                       '{0} → {1}'.format(context.chat_data['sender'],
-        #                                          app.bot_persistence.state['phones'][context.chat_data['receiver']]['nick']))
-        text = "На телефон: *{0}*\nАбоненту: *{1}*".format(esc_yml(context.chat_data['receiver']),
-                                                           esc_yml(app.bot_persistence.state['phones'][context.chat_data['receiver']]['nick']))
+        app.human._send_data({'@type': 'setChatTitle',
+                              'chat_id': context.chat_data['chat_id'],
+                              'title': '{0} → {1}'.format(context.chat_data['sender'],
+                                                          app.bot_persistence.state['phones'][context.chat_data['receiver']]['nick'])})
+        text = "На номер: *{0}*\nАбоненту: *{1}*".format(esc_yml(context.chat_data['receiver']),
+                                                         esc_yml(app.bot_persistence.state['phones'][context.chat_data['receiver']]['nick']))
     if app.bot_persistence.state['phones'][context.chat_data['receiver']]['site']:
-        text += "\nСайт: *{0}*".format(esc_yml(app.bot_persistence.state['phones'][context.chat_data['receiver']]['site']))
-    print(text)
-    res = app.bot.send_message(chat_id=context.chat_data['chat_id'], text=text,
-                               parse_mode=telegram.ParseMode.MARKDOWN)
-    #app.bot.pin_chat_message(context.chat_data['chat_id'], res.message_id,
-    #                         disable_notification=True)
-    text = "Пишет: *{0}* (уже *{1}* раз)".format(esc_yml(context.chat_data['sender']),
+        text += "\nСайт: *{0}*".format(app.bot_persistence.state['phones'][context.chat_data['receiver']]['site'])
+    app.bot.send_message(chat_id=context.chat_data['chat_id'], text=text,
+                         parse_mode=telegram.ParseMode.MARKDOWN)
+    text = "Пишет: *{0}* (уже *{1}-й* раз)".format(esc_yml(context.chat_data['sender']),
                                                  esc_yml(app.bot_persistence.state['phones'][context.chat_data['receiver']]['regulars'][context.chat_data['sender']]))
     if len(app.bot_persistence.state['phones'][context.chat_data['receiver']]['replies']):
         text += "\nБыстрые ответы:"
@@ -862,6 +859,18 @@ def human_connection_state_handler(update):
                                   'user_id': app.config['TELEGRAM_OWNER']})
 
 
+def human_incoming_handler(update):
+    if update.ID == 'updateNewMessage' and update.message.ID == 'message' and \
+            update.message.content.ID == 'messageText' and \
+            update.message.content.text.ID == 'formattedText':
+        text = update.message.content.text.text
+        if text.startswith('На номер: '):
+            app.human._send_data({'@type': 'pinChatMessage',
+                                  'chat_id': update.message.chat_id,
+                                  'message_id': update.message.id,
+                                  'disable_notification': True})
+
+
 def handle_human_init(update, context):
     text = update.message.text.lstrip('/set').split(' ', 1)
     app.bot.deleteMessage(chat_id=update.message.chat.id,
@@ -919,8 +928,8 @@ if __name__ == "__main__":
             PHONES_MENU: [CallbackQueryHandler(handle_back_query, pattern='^(Назад)$'),
                           CallbackQueryHandler(handle_cancel_query, pattern='^(Выход)$'),
                           CallbackQueryHandler(handle_add_phone_query, pattern='^(Добавить номер)$'),
-                          CallbackQueryHandler(handle_edit_phone_query, pattern='^Изменить (\d+)$'),
-                          CallbackQueryHandler(handle_del_phone_query, pattern='^Удалить (\d+)$')
+                          CallbackQueryHandler(handle_edit_phone_query, pattern='^Изменить (.+)$'),
+                          CallbackQueryHandler(handle_del_phone_query, pattern='^Удалить (.+)$')
                           ],
             NEW_PHONE: [MessageHandler(Filters.text, handle_add_phone)],
             NEW_REPLY: [MessageHandler(Filters.text, handle_add_quick_reply)],
@@ -934,6 +943,7 @@ if __name__ == "__main__":
         fallbacks=[CommandHandler('cancel', handle_cancel)]
     )
     sms_handler = ConversationHandler(
+        per_user=False,
         entry_points=[MessageHandler(Filters.status_update.chat_created | Filters.status_update.new_chat_members, handle_chat_start),
                       CommandHandler('help', handle_chat_start)],
         states={
@@ -951,7 +961,9 @@ if __name__ == "__main__":
     app.dispatcher.add_error_handler(handle_error)
     app.human.add_handler('error', human_error_handler)
     app.human.add_handler('updateAuthorizationState', human_auth_state_handler)
-    app.human.add_handler('updateConnectionState', human_connection_state_handler)
+    app.human.add_handler('updateConnectionState',
+                          human_connection_state_handler)
+    app.human.add_message_handler(human_incoming_handler)
     app.human._send_encryption_key()
     scheduler.init_app(app)
     scheduler.start()
