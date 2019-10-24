@@ -2,6 +2,7 @@
 
 import copy
 import json
+import logging
 import os
 import select
 import socket
@@ -44,14 +45,15 @@ app.dispatcher = Dispatcher(bot=app.bot, update_queue=None,
 app.bot.setWebhook(url='https://%s%s%s' % (app.config['SERVER_NAME'],
                                            app.config['APPLICATION_ROOT'],
                                            app.config['TELEGRAM_TOKEN']))
+# app.authorization_state = None
 app.human = TgClient(app.config['TELEGRAM_API_ID'],
                      app.config['TELEGRAM_API_HASH'],
                      use_message_database=False, tdlib_verbosity=2,
-                     bot=app.bot, phone=app.config['TELEGRAM_PHONE'],
+                     phone=app.config['TELEGRAM_PHONE'],
                      database_encryption_key='abret' + app.config['TELEGRAM_PHONE'] + 'bgty',
                      system_version='Linux',
-                     library_path='/tmp/td/tdlib/lib/libtdjson.so.1.5.0',
-                     bot_owner=app.config['TELEGRAM_OWNER'])
+                     library_path='/tmp/td/tdlib/lib/libtdjson.so.1.5.0')
+logger = logging.getLogger(__name__)
 
 
 @app.route(app.config['APPLICATION_ROOT'] + 'healthcheck')
@@ -99,13 +101,10 @@ def tgcli_send_command(cmd):
     return json.loads(res)
 
 
-authorization_state = None
-
-
 @scheduler.task('interval', id='get_sms', seconds=10, coalesce=False)
 def check_sms_and_chats():
-    if not app.human._authorized:
-        app.human.login_async()
+    # if app.human and not app.human._authorized:
+    #    app.human.login_async()
     now = int(time.time())
     if not app.bot_persistence.state \
             or 'phones' not in app.bot_persistence.state \
@@ -259,12 +258,22 @@ def proovl_webhook():
                 'incoming': 1,
                 'message': text,
             }
-            users = set([str(app.bot_persistence.state['self']),
-                         str(app.bot_persistence.state['bot_id'])])
+            users = set([app.bot_persistence.state['bot_id']])
             for user_id in app.bot_persistence.state['operators'].keys():
-                users.add(str(user_id))
-            tgcli_send_command('create_group_chat \'{0} → {1}\' user#{2}'.
-                               format(_from, to, ' user#'.join(users)))
+                users.add(user_id)
+            users.discard(app.bot_persistence.state['self'])
+            user_ids = [app.bot_persistence.state['self']]
+            user_ids.extend(users)
+            result = app.human._send_data({'@type': 'searchPublicChat',
+                                           'username': '@{0}'.format(app.bot_persistence.state['bot_username'])})
+            result.wait()
+            for user in user_ids:
+                result = app.human._send_data({'@type': 'getUser',
+                                               'user_id': user})
+                result.wait()
+            app.human._send_data({'@type': 'createNewBasicGroupChat',
+                                  'title': '{0} → {1}'.format(_from, to),
+                                  'user_ids': user_ids})
         else:
             app.bot_persistence.state['phones'][to]['chats'][_from]['last_message'] = int(time.time())
             app.bot_persistence.state['phones'][to]['chats'][_from].pop('try', None)
@@ -311,23 +320,25 @@ def menu_keyboard(context):
 def init_state():
     if not app.bot_persistence.state:
         me = app.bot.get_me()
-        payload = tgcli_send_command('get_self')
+        owner = app.bot.get_chat(app.config['TELEGRAM_OWNER'])
+        app.human._send_data({'@type': 'getUser', 'user_id': me.id})
         root = {
-            'id': payload['peer_id'],
-            'name': payload['print_name'],
-            'username': payload['username']
+            'id': owner.id,
+            'name': owner.first_name,
+            'username': owner.username
         }
         state = {
             'phones': {},
             'sms': {},
             'admins': {
-                payload['peer_id']: root,
+                owner.id: root,
             },
             'operators': {
-                payload['peer_id']: root,
+                owner.id: root,
             },
-            'self': payload['peer_id'],
+            'self': owner.id,
             'bot_id': me.id,
+            'bot_username': me.username,
         }
         app.bot_persistence.update_state(state)
 
@@ -427,12 +438,12 @@ def handle_back_query(update, context):
 
 def user_keyboard(context):
     if context.chat_data['user_type'] == 'Администраторы':
-        add_user_menu = '➕ Добавить администратора'
+        add_user_menu = 'Добавить администратора'
         state_field = 'admins'
     else:
-        add_user_menu = '➕ Добавить оператора'
+        add_user_menu = 'Добавить оператора'
         state_field = 'operators'
-    menu = [[telegram.InlineKeyboardButton(add_user_menu,
+    menu = [[telegram.InlineKeyboardButton('➕ ' + add_user_menu,
                                            callback_data=add_user_menu)]]
     for user in app.bot_persistence.state[state_field]:
         button = 'Удалить ' + \
@@ -474,20 +485,22 @@ def handle_set_user(update, context):
         user_type = 'оператор'
         state_field = 'operators'
     nick = update.message.text
-    payload = tgcli_send_command('resolve_username {0}'.
-                                 format(nick.lstrip('@')))
-    if 'result' in payload:
+    result = app.human._send_data({'@type': 'searchPublicChat',
+                                   'username': nick})
+    result.wait()
+    if result.update['@type'] != 'chat':
         result = 'Пользователь с ником {0} не найден'.format(nick)
     else:
-        if payload['peer_id'] in app.bot_persistence.state[state_field]:
+        user = {
+            'id': result.update['id'],
+            'name': result.update['title'],
+            'username': nick.lstrip('@'),
+        }
+        app.human._send_data({'@type': 'getUser', 'user_id': user['id']})
+        if user['id'] in app.bot_persistence.state[state_field]:
             result = 'Пользователь с ником {0} уже {1}'.format(nick, user_type)
         else:
-            user = {
-                'id': payload['peer_id'],
-                'name': payload['print_name'],
-                'username': payload['username']
-            }
-            app.bot_persistence.state[state_field][payload['peer_id']] = user
+            app.bot_persistence.state[state_field][user['id']] = user
             result = 'Пользователь с ником {0} теперь {1}!'.format(nick,
                                                                    user_type)
             app.bot_persistence.update_state(app.bot_persistence.state)
@@ -532,9 +545,9 @@ def handle_chat_start(update, context):
     context.chat_data['chat_id'] = update.message.chat.id
     chat = app.bot.get_chat(context.chat_data['chat_id'])
     title = chat.description or update.message.chat.title
-    if not chat.description:
-        app.bot.set_chat_description(context.chat_data['chat_id'],
-                                     update.message.chat.title)
+    #if not chat.description:
+    #    app.bot.set_chat_description(context.chat_data['chat_id'],
+    #                                 update.message.chat.title)
     context.chat_data['sender'] = title.split(' ')[0]
     context.chat_data['receiver'] = title.split(' ')[-1]
     init_receiver(context.chat_data['receiver'])
@@ -558,15 +571,18 @@ def handle_chat_start(update, context):
     app.bot_persistence.update_state(app.bot_persistence.state)
     text = 'Абоненту: *{0}*'.format(context.chat_data['receiver'])
     if app.bot_persistence.state['phones'][context.chat_data['receiver']]['nick'] != context.chat_data['receiver']:
-        app.bot.set_chat_title(context.chat_data['chat_id'],
-                               '{0} → {1}'.format(context.chat_data['sender'],
-                                                  app.bot_persistence.state['phones'][context.chat_data['receiver']]['nick']))
-        text = "На телефон: *{0}*\nАбоненту: *{1}*".format(context.chat_data['receiver'], app.bot_persistence.state['phones'][context.chat_data['receiver']]['nick'])
+        #app.bot.set_chat_title(context.chat_data['chat_id'],
+        #                       '{0} → {1}'.format(context.chat_data['sender'],
+        #                                          app.bot_persistence.state['phones'][context.chat_data['receiver']]['nick']))
+        text = "На телефон: *{0}*\nАбоненту: *{1}*".format(context.chat_data['receiver'],
+                                                           app.bot_persistence.state['phones'][context.chat_data['receiver']]['nick'])
     if app.bot_persistence.state['phones'][context.chat_data['receiver']]['site']:
-        text += "\nСайт: {0}".format(app.bot_persistence.state['phones'][context.chat_data['receiver']]['site'])
-    res = app.bot.send_message(chat_id=context.chat_data['chat_id'], text=text)
-    app.bot.pin_chat_message(context.chat_data['chat_id'], res.message_id,
-                             disable_notification=True)
+        text += "\nСайт: *{0}*".format(app.bot_persistence.state['phones'][context.chat_data['receiver']]['site'])
+    print(text)
+    res = app.bot.send_message(chat_id=context.chat_data['chat_id'], text=text,
+                               parse_mode=telegram.ParseMode.MARKDOWN)
+    #app.bot.pin_chat_message(context.chat_data['chat_id'], res.message_id,
+    #                         disable_notification=True)
     text = 'Пишет: *{0}*'.format(context.chat_data['sender'])
     if len(app.bot_persistence.state['phones'][context.chat_data['receiver']]['replies']):
         text += "\nБыстрые ответы:"
@@ -574,7 +590,8 @@ def handle_chat_start(update, context):
             if app.bot_persistence.state['phones'][context.chat_data['receiver']]['replies'][reply]:
                 text += "\n*{0}*: {1}".format(reply,
                                               app.bot_persistence.state['phones'][context.chat_data['receiver']]['replies'][reply])
-    app.bot.send_message(chat_id=context.chat_data['chat_id'], text=text)
+    app.bot.send_message(chat_id=context.chat_data['chat_id'], text=text,
+                         parse_mode=telegram.ParseMode.MARKDOWN)
     if 'message' in app.bot_persistence.state['phones'][context.chat_data['receiver']]['chats'][context.chat_data['sender']]:
         app.bot.send_message(chat_id=context.chat_data['chat_id'],
                              parse_mode=telegram.ParseMode.MARKDOWN,
@@ -785,11 +802,49 @@ def handle_sms(update, context):
     return real_handle_sms(update.message, context)
 
 
+def human_error_handler(update):
+    if update['message'] == 'Database encryption key is needed: call checkDatabaseEncryptionKey first':
+        app.human._send_encryption_key()
+    elif update['message'] == 'Initialization parameters are needed: call setTdlibParameters first':
+        app.human._set_initial_params()
+
+
+def human_auth_state_handler(update):
+    if update.authorization_state.ID == 'authorizationStateWaitPhoneNumber':
+        app.human._send_phone_number_or_bot_token()
+    elif update.authorization_state.ID == 'authorizationStateWaitEncryptionKey':
+        app.human._send_encryption_key()
+    elif update.authorization_state.ID == 'authorizationStateWaitTdlibParameters':
+        app.human._set_initial_params()
+    elif update.authorization_state.ID == 'authorizationStateWaitCode':
+        app.bot.send_message(chat_id=app.config['TELEGRAM_OWNER'], text='code?')
+    elif update.authorization_state.ID == 'authorizationStateWaitPassword':
+        app.bot.send_message(chat_id=app.config['TELEGRAM_OWNER'], text='password?')
+    elif update.authorization_state.ID == 'authorizationStateReady':
+        app.human._complete_authorization()
+        app.human._send_data({'@type': 'getUser',
+                              'user_id': app.config['TELEGRAM_OWNER']})
+
+
+def human_connection_state_handler(update):
+    if update.state.ID == 'connectionStateReady':
+        if app.human._authorized:
+            app.human._send_data({'@type': 'getUser',
+                                  'user_id': app.config['TELEGRAM_OWNER']})
+
+
 def handle_human_init(update, context):
     text = update.message.text.lstrip('/set').split(' ', 1)
     app.bot.deleteMessage(chat_id=update.message.chat.id,
                           message_id=update.message.message_id)
-    # app.human.ready_send(text[0], text[1])
+    data = {'@type': 'checkAuthenticationPassword',
+            text[0]: text[1]}
+    if len(text) == 2:
+        if text[0] == 'code':
+            text[1] = text[1][len(text[1])::-1]
+            data[text[0]] = text[1]
+            data['@type'] = 'checkAuthenticationCode'
+    app.human._send_data(data, result_id='updateAuthorizationState')
     return ConversationHandler.END
 
 
@@ -865,6 +920,10 @@ if __name__ == "__main__":
     app.dispatcher.add_handler(conv_handler)
     app.dispatcher.add_handler(sms_handler)
     app.dispatcher.add_error_handler(handle_error)
+    app.human.add_handler('error', human_error_handler)
+    app.human.add_handler('updateAuthorizationState', human_auth_state_handler)
+    app.human.add_handler('updateConnectionState', human_connection_state_handler)
+    app.human._send_encryption_key()
     scheduler.init_app(app)
     scheduler.start()
     app.run(host=app.config['FLASK_RUN_HOST'],

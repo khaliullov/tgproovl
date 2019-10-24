@@ -1,13 +1,11 @@
 import logging
-from typing import Optional, Type
+from typing import Optional, Type, Callable
 import sys
-import time
 
 from pytglib import VERSION
 from pytglib.client import Telegram
 from pytglib.utils import AsyncResult
 from pytglib.worker import BaseWorker
-import telegram
 
 
 logger = logging.getLogger(__name__)
@@ -40,12 +38,7 @@ class TgClient(Telegram):
             login: bool = False,
             default_workers_queue_size=1000,
             tdlib_verbosity: int = 2,
-            bot: telegram.Bot = None,
-            bot_owner: str = None,
     ) -> None:
-        self.bot = bot
-        self.bot_owner = bot_owner
-        self.authorization_state = None
         super(TgClient, self).__init__(api_id=api_id, api_hash=api_hash,
                                        database_encryption_key=database_encryption_key,
                                        phone=phone, bot_token=bot_token,
@@ -71,69 +64,12 @@ class TgClient(Telegram):
         async_result = AsyncResult(client=self, result_id=result_id)
         data['@extra']['request_id'] = async_result.id
 
+        logger.info('Sending to TG: %s', data)
         self._tdjson.send(data)
         self._results[async_result.id] = async_result
         async_result.request = data
 
         return async_result
-
-    def _create_result(self, data: dict, result_id: str = None) -> AsyncResult:
-        if '@extra' not in data:
-            data['@extra'] = {}
-
-        if not result_id and 'request_id' in data['@extra']:
-            result_id = data['@extra']['request_id']
-
-        async_result = AsyncResult(client=self, result_id=result_id)
-        data['@extra']['request_id'] = async_result.id
-
-        self._results[async_result.id] = async_result
-        async_result.request = data
-
-        return async_result
-
-    def ready_send(self, field, value):
-        async_result = self._results['updateAuthorizationState']
-        async_result.request[field] = value
-        logger.info('Sending to TG: %s', async_result.request)
-        self._tdjson.send(async_result.request)
-
-    def _send_telegram_code(self) -> AsyncResult:
-        data = {'@type': 'checkAuthenticationCode'}
-
-        self.bot.send_message(chat_id=self.bot_owner, text='code?')
-        self.authorization_state = 'Idle'
-
-        return self._create_result(data, result_id='updateAuthorizationState')
-
-    def _send_password(self) -> AsyncResult:
-        data = {'@type': 'checkAuthenticationPassword'}
-
-        self.bot.send_message(chat_id=self.bot_owner, text='{} password?')
-        self.authorization_state = 'Idle'
-
-        return self._create_result(data, result_id='updateAuthorizationState')
-
-    def _idle(self):
-        time.sleep(0.01)
-
-    def login_async(self):
-        """
-        Login process (blocking)
-        Must be called before any other call. It sends initial params to the tdlib, sets database encryption key, etc.
-        """
-        actions = {
-            None: self._send_encryption_key,
-            'Idle': self._idle,
-            'authorizationStateWaitTdlibParameters': self._set_initial_params,
-            'authorizationStateWaitEncryptionKey': self._send_encryption_key,
-            'authorizationStateWaitPhoneNumber': self._send_phone_number_or_bot_token,
-            'authorizationStateWaitCode': self._send_telegram_code,
-            'authorizationStateWaitPassword': self._send_password,
-            'authorizationStateReady': self._complete_authorization,
-        }
-        if not self._authorized:
-            actions[self.authorization_state]()
 
     def _listen_to_td(self):
         logger.info('[pytglib.td_listener] started')
@@ -144,37 +80,22 @@ class TgClient(Telegram):
             logger.debug('Update: %s', update)
 
             if update:
-                self._update_async_result(update)
+                try:
+                    self._update_async_result(update)
+                except Exception:
+                    if update.get('@type') == 'updateAuthorizationState':
+                        request_id = update['@type']
+                    else:
+                        request_id = update.get('@extra', {}).get('request_id')
+                    async_result = self._results.pop(request_id, None)
+                    async_result.update = update
                 self._run_handlers(update)
 
-    def _update_async_result(self, update: dict) -> Optional[AsyncResult]:
-        async_result = None
-
-        _special_types = (
-            'updateAuthorizationState',
-        )  # for authorizationProcess @extra.request_id doesn't work
-
-        if update.get('@type') in _special_types:
-            request_id = update['@type']
-        else:
-            request_id = update.get('@extra', {}).get('request_id')
-
-        if not request_id:
-            logger.debug('request_id has not been found in the update')
-        else:
-            async_result = self._results.get(request_id)
-
-        if not async_result:
-            logger.debug('async_result has not been found in by request_id=%s', request_id)
-        else:
-            if update['@type'] == 'updateAuthorizationState':
-                self.authorization_state = update['authorization_state']['@type']
-            elif update['@type'] == 'error':
-                if update['message'] == 'Database encryption key is needed: call checkDatabaseEncryptionKey first':
-                    self.authorization_state = 'authorizationStateWaitEncryptionKey'
-                elif update['message'] == 'Initialization parameters are needed: call setTdlibParameters first':
-                    self.authorization_state = 'authorizationStateWaitTdlibParameters'
-            async_result.parse_update(update)
-            self._results.pop(request_id, None)
-
-        return async_result
+    def add_handler(self, event, func: Callable) -> None:
+        """
+        Adds function to handle all incoming messages
+        Args:
+            func (:obj:`Callable`):
+                Message handler function
+        """
+        self.add_update_handler(event, func)
