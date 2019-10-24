@@ -202,6 +202,18 @@ def send_sms(_from, to, text, tariff=app.config['PROOVL_TARIFF']):
     return status, message_id
 
 
+def esc_yml(text):
+    return str(text).translate({
+        ord('_'): '＿',
+        ord('*'): '⁎',
+        ord('['): '\\[',
+        ord(']'): '\\]',
+        ord('('): '\\(',
+        ord(')'): '\\)',
+        ord('`'): '\\`',
+    })
+
+
 @app.route(app.config['APPLICATION_ROOT'] + 'incoming_sms', methods=['POST'])
 def proovl_webhook():
     token = request.values.get('token')
@@ -218,7 +230,8 @@ def proovl_webhook():
             app.bot.edit_message_text(
                 chat_id=app.bot_persistence.state['sms'][_id]['chat_id'],
                 message_id=app.bot_persistence.state['sms'][_id]['message_id'],
-                text='Сообщение *{0}* доставлено со статусом *{1}*'.format(_id, status),
+                text='Сообщение *{0}* доставлено со статусом *{1}*'.format(esc_yml(_id),
+                                                                           esc_yml(status)),
                 parse_mode=telegram.ParseMode.MARKDOWN
             )
             app.bot_persistence.state['sms'][_id]['status'] = status
@@ -226,14 +239,18 @@ def proovl_webhook():
             if status != 'Delivered' and app.bot_persistence.state['sms'][_id]['tariff'] == 2:
                 sms = copy.copy(app.bot_persistence.state['sms'][_id])
                 res = app.bot.send_message(chat_id=app.bot_persistence.state['sms'][_id]['chat_id'],
-                                           text="Отравка сообщения \"*{0}*\" провалилась со статусом *{1}*.\nПробую отправить с более дорогим тарифом".format(sms['text'], SMS_STATUS_RU.get(status, status)),
+                                           text="Отравка сообщения \"*{0}*\""
+                                                " провалилась со статусом *{1}*.\n"
+                                                "Пробую отправить с более дорогим тарифом".format(esc_yml(sms['text']),
+                                                                                                  esc_yml(SMS_STATUS_RU.get(status, status))),
                                            parse_mode=telegram.ParseMode.MARKDOWN)
                 app.bot_persistence.state['sms'].pop(_id, None)
                 sms['tariff'] = 1
                 app.bot_persistence.state['phones'][sms['from']]['chats'][sms['to']]['tariff'] = 1
                 status, message_id = send_sms(sms['from'], sms['to'], sms['text'], 1)
                 res = app.bot.send_message(chat_id=sms['chat_id'], reply_to_message_id=res.message_id,
-                                           text='Сообщение *{0}* отправлено со статусом *{1}*'.format(message_id, SMS_STATUS_RU.get(status, status)),
+                                           text='Сообщение *{0}* отправлено со статусом *{1}*'.
+                                           format(esc_yml(message_id), esc_yml(SMS_STATUS_RU.get(status, status))),
                                            parse_mode=telegram.ParseMode.MARKDOWN)
                 sms['message_id'] = res.message_id
                 sms['remote_id'] = message_id
@@ -247,17 +264,13 @@ def proovl_webhook():
         init_receiver(to)
         translation = app.translator.translate(text, dest='ru')
         if translation.text != text:
-            text += "\nПеревод (c *{0}* на ru): *{1}*".format(translation.src,
-                                                              translation.text)
+            text = "_{0}_\n"\
+                   "Перевод (c *{1}* на ru): *{2}*".format(esc_yml(text),
+                                                           esc_yml(translation.src),
+                                                           esc_yml(translation.text))
         else:
-            text = '*{0}*'.format(text)
+            text = '*{0}*'.format(esc_yml(text))
         if _from not in app.bot_persistence.state['phones'][to]['chats']:
-            app.bot_persistence.state['phones'][to]['chats'][_from] = {
-                'last_message': int(time.time()),
-                'tariff': app.config['PROOVL_TARIFF'],
-                'incoming': 1,
-                'message': text,
-            }
             users = set([app.bot_persistence.state['bot_id']])
             for user_id in app.bot_persistence.state['operators'].keys():
                 users.add(user_id)
@@ -271,9 +284,26 @@ def proovl_webhook():
                 result = app.human._send_data({'@type': 'getUser',
                                                'user_id': user})
                 result.wait()
-            app.human._send_data({'@type': 'createNewBasicGroupChat',
-                                  'title': '{0} → {1}'.format(_from, to),
-                                  'user_ids': user_ids})
+            result = app.human._send_data({'@type': 'createNewBasicGroupChat',
+                                           'title': '{0} → {1}'.format(_from, to),
+                                           'user_ids': user_ids})
+            result.wait()
+            if result.update['@type'] == 'chat':
+                app.bot_persistence.state['phones'][to]['chats'][_from] = {
+                    'last_message': int(time.time()),
+                    'tariff': app.config['PROOVL_TARIFF'],
+                    'incoming': 1,
+                    'message': text,
+                }
+                app.bot_persistence.state['phones'][to]['chats'][_from]['chat_id'] = result.update['id']
+            else:
+                app.bot.send_message(chat_id=app.config['TELEGRAM_DEVELOPER'],
+                                     text="Ошибка создания канала!\n"
+                                          "Сообщение от *{0}* для *{1}*\n"
+                                          "{2}".format(esc_yml(_from),
+                                                       esc_yml(to),
+                                                       text),
+                                     parse_mode=telegram.ParseMode.MARKDOWN)
         else:
             app.bot_persistence.state['phones'][to]['chats'][_from]['last_message'] = int(time.time())
             app.bot_persistence.state['phones'][to]['chats'][_from].pop('try', None)
@@ -282,7 +312,9 @@ def proovl_webhook():
             else:
                 app.bot_persistence.state['phones'][to]['chats'][_from]['incoming'] = 1
             app.bot.send_message(chat_id=app.bot_persistence.state['phones'][to]['chats'][_from]['chat_id'],
-                                 text=text, parse_mode=telegram.ParseMode.MARKDOWN)
+                                 text=text,
+                                 parse_mode=telegram.ParseMode.MARKDOWN)
+        app.bot_persistence.update_state(app.bot_persistence.state)
     return 'OK'
 
 
@@ -543,11 +575,7 @@ def handle_phones(update, context):
 def handle_chat_start(update, context):
     init_state()
     context.chat_data['chat_id'] = update.message.chat.id
-    chat = app.bot.get_chat(context.chat_data['chat_id'])
-    title = chat.description or update.message.chat.title
-    #if not chat.description:
-    #    app.bot.set_chat_description(context.chat_data['chat_id'],
-    #                                 update.message.chat.title)
+    title = update.message.chat.title
     context.chat_data['sender'] = title.split(' ')[0]
     context.chat_data['receiver'] = title.split(' ')[-1]
     init_receiver(context.chat_data['receiver'])
@@ -569,27 +597,28 @@ def handle_chat_start(update, context):
         'tariff': app.config['PROOVL_TARIFF'],
     })
     app.bot_persistence.update_state(app.bot_persistence.state)
-    text = 'Абоненту: *{0}*'.format(context.chat_data['receiver'])
+    text = 'Абоненту: *{0}*'.format(esc_yml(context.chat_data['receiver']))
     if app.bot_persistence.state['phones'][context.chat_data['receiver']]['nick'] != context.chat_data['receiver']:
         #app.bot.set_chat_title(context.chat_data['chat_id'],
         #                       '{0} → {1}'.format(context.chat_data['sender'],
         #                                          app.bot_persistence.state['phones'][context.chat_data['receiver']]['nick']))
-        text = "На телефон: *{0}*\nАбоненту: *{1}*".format(context.chat_data['receiver'],
-                                                           app.bot_persistence.state['phones'][context.chat_data['receiver']]['nick'])
+        text = "На телефон: *{0}*\nАбоненту: *{1}*".format(esc_yml(context.chat_data['receiver']),
+                                                           esc_yml(app.bot_persistence.state['phones'][context.chat_data['receiver']]['nick']))
     if app.bot_persistence.state['phones'][context.chat_data['receiver']]['site']:
-        text += "\nСайт: *{0}*".format(app.bot_persistence.state['phones'][context.chat_data['receiver']]['site'])
+        text += "\nСайт: *{0}*".format(esc_yml(app.bot_persistence.state['phones'][context.chat_data['receiver']]['site']))
     print(text)
     res = app.bot.send_message(chat_id=context.chat_data['chat_id'], text=text,
                                parse_mode=telegram.ParseMode.MARKDOWN)
     #app.bot.pin_chat_message(context.chat_data['chat_id'], res.message_id,
     #                         disable_notification=True)
-    text = 'Пишет: *{0}*'.format(context.chat_data['sender'])
+    text = "Пишет: *{0}* (уже *{1}* раз)".format(esc_yml(context.chat_data['sender']),
+                                                 esc_yml(app.bot_persistence.state['phones'][context.chat_data['receiver']]['regulars'][context.chat_data['sender']]))
     if len(app.bot_persistence.state['phones'][context.chat_data['receiver']]['replies']):
         text += "\nБыстрые ответы:"
         for reply in app.bot_persistence.state['phones'][context.chat_data['receiver']]['replies']:
             if app.bot_persistence.state['phones'][context.chat_data['receiver']]['replies'][reply]:
-                text += "\n*{0}*: {1}".format(reply,
-                                              app.bot_persistence.state['phones'][context.chat_data['receiver']]['replies'][reply])
+                text += "\n*{0}*: {1}".format(esc_yml(reply),
+                                              esc_yml(app.bot_persistence.state['phones'][context.chat_data['receiver']]['replies'][reply]))
     app.bot.send_message(chat_id=context.chat_data['chat_id'], text=text,
                          parse_mode=telegram.ParseMode.MARKDOWN)
     if 'message' in app.bot_persistence.state['phones'][context.chat_data['receiver']]['chats'][context.chat_data['sender']]:
