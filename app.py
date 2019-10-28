@@ -112,22 +112,30 @@ def remove_chat(update):
 
 
 def send_bot_message(update):
+    logger.debug('Update send_bot_messaage: %s', update)
     message = update.get('message', None)
-    chat_id = update['chat_id']
+    chat_id = update.get('chat_id', None)
     text = update['text']
+    reply_markup = update.get('reply_markup', telegram.ReplyKeyboardRemove())
     reply_to_message_id = update.get('reply_to_message_id', None)
     parse_mode = update.get('parse_mode', None)
     try:
         if message:
-            pass
+            message.reply_text(text, reply_markup=reply_markup,
+                               parse_mode=parse_mode)
         else:
-            app.bot.send_message(chat_id=chat_id, text=text,
-                                 parse_mode=parse_mode,
+            app.bot.send_message(chat_id=chat_id, reply_markup=reply_markup,
+                                 parse_mode=parse_mode, text=text,
                                  reply_to_message_id=reply_to_message_id)
     except telegram.error.Unauthorized:
         pass
     except Exception:
-        pass  # TODO send to developer
+        if chat_id != app.config['TELEGRAM_DEVELOPER']:
+            app.queue.put((send_bot_message, {
+                'chat_id': app.config['TELEGRAM_DEVELOPER'],
+                'text': "Ошибка отправки сообщения на канал {0}\n{1}".format(chat_id, text),
+                'parse_mode': telegram.ParseMode.MARKDOWN
+            }), timeout=10)
     return True
 
 
@@ -446,10 +454,16 @@ def start(update, context):
     init_state()
     user = update.message.from_user
     if user.id in app.bot_persistence.state['admins']:
-        update.message.reply_text('{0}, снова привет!'.format(user.first_name),
-                                  reply_markup=menu_keyboard(context))
+        app.queue.put((send_bot_message, {
+            'message': update.message,
+            'text': '{0}, снова привет!'.format(user.first_name),
+            'reply_markup': menu_keyboard(context)
+        }), timeout=10)
         return save_state(context, CONFIG)
-    update.message.reply_text('Впервые вижу')
+    app.queue.put((send_bot_message, {
+        'message': update.message,
+        'text': 'Впервые вижу'
+    }), timeout=10)
     return save_state(context, PASSWORD)
 
 
@@ -465,24 +479,29 @@ def handle_password(update, context):
                 'username': user.username
             }
         app.bot_persistence.save_state()
-        update.message.reply_text('Привет, {0}'.format(user.first_name),
-                                  reply_markup=menu_keyboard(context))
+        app.queue.put((send_bot_message, {
+            'message': update.message,
+            'text': 'Привет, {0}'.format(user.first_name),
+            'reply_markup': menu_keyboard(context)
+        }), timeout=10)
         return save_state(context, CONFIG)
     else:
-        update.message.reply_text('Пока!',
-                                  reply_markup=telegram.ReplyKeyboardRemove())
-    return ConversationHandler.END
-
-
-def handle_cancel(update, context):
-    update.callback_query.message.reply_text('Береги себя!',
-                              reply_markup=telegram.ReplyKeyboardRemove())
+        app.queue.put((send_bot_message, {
+            'message': update.message,
+            'text': 'Пока!'
+        }), timeout=10)
     return ConversationHandler.END
 
 
 def handle_cancel_query(update, context):
-    update.callback_query.message.reply_text('Береги себя!',
-                                             reply_markup=telegram.ReplyKeyboardRemove())
+    if update.message:
+        message = update.message
+    else:
+        message = update.callback_query.message
+    app.queue.put((send_bot_message, {
+        'message': message,
+        'text': 'Береги себя!',
+    }), timeout=10)
     return ConversationHandler.END
 
 
@@ -490,20 +509,26 @@ def handle_balance(update, context):
     r = requests.get('https://www.proovl.com/api/balance.php',
                      params={'user': app.config['PROOVL_USER'],
                              'token': app.config['PROOVL_TOKEN']})
-    update.callback_query.message.reply_text('Баланс: {0}'.format(r.text),
-                              reply_markup=menu_keyboard(context))
+    app.queue.put((send_bot_message, {
+        'message': update.callback_query.message,
+        'text': 'Баланс: {0}'.format(r.text),
+        'reply_markup': menu_keyboard(context)
+    }), timeout=10)
     return save_state(context, CONFIG)
 
 
 def handle_back(update, context):
     if context.chat_data['state'] == CONFIG:
-        return handle_cancel(update, context)
+        return handle_cancel_query(update, context)
     if context.chat_data['state'] == USERS:
         save_state(context, CONFIG)
-        update.callback_query.message.reply_text('Основное меню',
-                                  reply_markup=menu_keyboard(context))
+        app.queue.put((send_bot_message, {
+            'message': update.callback_query.message,
+            'text': 'Основное меню',
+            'reply_markup': menu_keyboard(context)
+        }), timeout=10)
         return CONFIG
-    return handle_cancel(update, context)
+    return handle_cancel_query(update, context)
 
 
 def add_phone_keyboard():
@@ -522,18 +547,23 @@ def add_phone_keyboard():
     return telegram.InlineKeyboardMarkup(button_list)
 
 
-
 def handle_back_query(update, context):
     if context.chat_data['state'] == PHONES_MENU:
         save_state(context, CONFIG)
-        update.callback_query.message.reply_text('Основное меню',
-                                                 reply_markup=menu_keyboard(context))
+        app.queue.put((send_bot_message, {
+            'message': update.callback_query.message,
+            'text': 'Основное меню',
+            'reply_markup': menu_keyboard(context)
+        }), timeout=10)
         return CONFIG
     elif context.chat_data['state'] == PHONE_EDIT:
-        update.callback_query.message.reply_text('Редактирование номеров телефонов',
-                                                 reply_markup=add_phone_keyboard())
+        app.queue.put((send_bot_message, {
+            'message': update.callback_query.message,
+            'text': 'Редактирование номеров телефонов',
+            'reply_markup': add_phone_keyboard()
+        }), timeout=10)
         return save_state(context, PHONES_MENU)
-    return handle_cancel(update, context)
+    return handle_cancel_query(update, context)
 
 
 def user_keyboard(context):
@@ -563,7 +593,11 @@ def handle_users(update, context):
         reply = 'Управление администраторами'
     else:
         reply = 'Управление операторами'
-    update.callback_query.message.reply_text(reply, reply_markup=user_keyboard(context))
+    app.queue.put((send_bot_message, {
+        'message': update.callback_query.message,
+        'text': reply,
+        'reply_markup': user_keyboard(context)
+    }), timeout=10)
     return save_state(context, USERS)
 
 
@@ -572,8 +606,10 @@ def handle_add_user(update, context):
         reply = 'Введите ник нового администратора, например: @shishkova'
     else:
         reply = 'Введите ник нового оператора, например: @timati'
-    update.callback_query.message.reply_text(reply,
-                                             reply_markup=telegram.ReplyKeyboardRemove())
+    app.queue.put((send_bot_message, {
+        'message': update.callback_query.message,
+        'text': reply
+    }), timeout=10)
     return save_state(context, NEW_USER)
 
 
@@ -607,7 +643,11 @@ def handle_set_user(update, context):
             with lock:
                 app.bot_persistence.state[state_field][user['id']] = user
             app.bot_persistence.save_state()
-    update.message.reply_text(result, reply_markup=user_keyboard(context))
+    app.queue.put((send_bot_message, {
+        'message': update.message,
+        'text': result,
+        'reply_markup': user_keyboard(context)
+    }), timeout=10)
     return save_state(context, USERS)
 
 
@@ -634,13 +674,20 @@ def handle_del_user(update, context):
             app.bot_persistence.state[state_field].pop(user_id, None)
         app.bot_persistence.save_state()
         result = '{0} больше не {1}!'.format(nick, user_type)
-    update.callback_query.message.reply_text(result, reply_markup=user_keyboard(context))
+    app.queue.put((send_bot_message, {
+        'message': update.callback_query.message,
+        'text': result,
+        'reply_markup': user_keyboard(context)
+    }), timeout=10)
     return save_state(context, USERS)
 
 
 def handle_phones(update, context):
-    reply = 'Редактирование номеров телефонов'
-    update.callback_query.message.reply_text(reply, reply_markup=add_phone_keyboard())
+    app.queue.put((send_bot_message, {
+        'message': update.callback_query.message,
+        'text': 'Редактирование номеров телефонов',
+        'reply_markup': add_phone_keyboard()
+    }), timeout=10)
     return save_state(context, PHONES_MENU)
 
 
@@ -681,8 +728,11 @@ def handle_chat_start(update, context):
                                                          esc_yml(app.bot_persistence.state['phones'][context.chat_data['receiver']]['nick']))
     if app.bot_persistence.state['phones'][context.chat_data['receiver']]['site']:
         text += "\nСайт: *{0}*".format(app.bot_persistence.state['phones'][context.chat_data['receiver']]['site'])
-    app.bot.send_message(chat_id=context.chat_data['chat_id'], text=text,
-                         parse_mode=telegram.ParseMode.MARKDOWN)
+    app.queue.put((send_bot_message, {
+        'chat_id': context.chat_data['chat_id'],
+        'text': text,
+        'parse_mode': telegram.ParseMode.MARKDOWN
+    }), timeout=10)
     text = "Пишет: *{0}* (уже *{1}-й* раз)".format(esc_yml(context.chat_data['sender']),
                                                  esc_yml(app.bot_persistence.state['phones'][context.chat_data['receiver']]['regulars'][context.chat_data['sender']]))
     if len(app.bot_persistence.state['phones'][context.chat_data['receiver']]['replies']):
@@ -691,12 +741,17 @@ def handle_chat_start(update, context):
             if app.bot_persistence.state['phones'][context.chat_data['receiver']]['replies'][reply]:
                 text += "\n*{0}*: {1}".format(esc_yml(reply),
                                               esc_yml(app.bot_persistence.state['phones'][context.chat_data['receiver']]['replies'][reply]))
-    app.bot.send_message(chat_id=context.chat_data['chat_id'], text=text,
-                         parse_mode=telegram.ParseMode.MARKDOWN)
+    app.queue.put((send_bot_message, {
+        'chat_id': context.chat_data['chat_id'],
+        'text': text,
+        'parse_mode': telegram.ParseMode.MARKDOWN
+    }), timeout=10)
     if 'message' in app.bot_persistence.state['phones'][context.chat_data['receiver']]['chats'][context.chat_data['sender']]:
-        app.bot.send_message(chat_id=context.chat_data['chat_id'],
-                             parse_mode=telegram.ParseMode.MARKDOWN,
-                             text=app.bot_persistence.state['phones'][context.chat_data['receiver']]['chats'][context.chat_data['sender']]['message'])
+        app.queue.put((send_bot_message, {
+            'chat_id': context.chat_data['chat_id'],
+            'text': app.bot_persistence.state['phones'][context.chat_data['receiver']]['chats'][context.chat_data['sender']]['message'],
+            'parse_mode': telegram.ParseMode.MARKDOWN
+        }), timeout=10)
         with lock:
             app.bot_persistence.state['phones'][context.chat_data['receiver']]['chats'][context.chat_data['sender']].pop('message', None)
         app.bot_persistence.save_state()
@@ -741,7 +796,10 @@ def real_handle_sms(message, context):
                                   context.chat_data['sender'],
                                   message.text, tariff)
     if status == 'Error':
-        message.reply_text('Ошибка при отправке сообщения: {0}'.format(message_id))
+        app.queue.put((send_bot_message, {
+            'message': message,
+            'text': 'Ошибка при отправке сообщения: {0}'.format(message_id)
+        }), timeout=10)
     else:
         res = message.reply_text('Сообщение *{0}* отправлено со статусом *{1}*'.format(message_id, SMS_STATUS_RU.get(status, status)),
                                  parse_mode=telegram.ParseMode.MARKDOWN)
@@ -760,23 +818,30 @@ def handle_send_translate_query(update, context):
 
 
 def handle_add_phone_query(update, context):
-    update.callback_query.message.reply_text('Введи новый номер телефона (например, 33666555777):',
-                                             reply_markup=telegram.ReplyKeyboardRemove())
+    app.queue.put((send_bot_message, {
+        'message': update.callback_query.message,
+        'text': 'Введи новый номер телефона (например, 33666555777):'
+    }), timeout=10)
     return save_state(context, NEW_PHONE)
 
 
 def handle_del_phone_query(update, context):
     phone = context.matches[0].group(1)
-    app.bot_persistence.state['phones'].pop(phone, None)
     # TODO: exit from all chats!!!
-    reply = 'Редактирование номеров телефонов'
-    update.callback_query.message.reply_text(reply, reply_markup=add_phone_keyboard())
+    app.bot_persistence.state['phones'].pop(phone, None)
+    app.queue.put((send_bot_message, {
+        'message': update.callback_query.message,
+        'text': 'Редактирование номеров телефонов',
+        'reply_markup': add_phone_keyboard()
+    }), timeout=10)
     return save_state(context, PHONES_MENU)
 
 
 def handle_add_quick_reply_name_query(update, context):
-    update.callback_query.message.reply_text('Ввведи название быстрого ответа (например, 🗺 address, 💶 price, 🔑 intercom):',
-                                             reply_markup=telegram.ReplyKeyboardRemove())
+    app.queue.put((send_bot_message, {
+        'message': update.callback_query.message,
+        'text': 'Ввведи название быстрого ответа (например, 🗺 address, 💶 price, 🔑 intercom):'
+    }), timeout=10)
     return save_state(context, NEW_REPLY)
 
 
@@ -784,11 +849,16 @@ def handle_add_quick_reply(update, context):
     text = update.message.text
     phone = context.chat_data['phone']
     if text in app.bot_persistence.state['phones'][phone].keys():
-        update.message.reply_text('Это слово зарезервировано, попробуй другое')
+        app.queue.put((send_bot_message, {
+            'message': update.message,
+            'text': 'Это слово зарезервировано, попробуй другое'
+        }), timeout=10)
         return save_state(context, NEW_REPLY)
     context.chat_data['reply'] = text
-    update.message.reply_text('Введи быстрый ответ для {0}:'.format(text),
-                              reply_markup=telegram.ReplyKeyboardRemove())
+    app.queue.put((send_bot_message, {
+        'message': update.message,
+        'text': 'Введи быстрый ответ для {0}:'.format(text)
+    }), timeout=10)
     return save_state(context, SET_PHONE_PROPERTY)
 
 
@@ -830,9 +900,12 @@ def handle_add_phone(update, context):
     phone = update.message.text.lstrip('+')
     init_receiver(phone)
     context.chat_data['phone'] = phone
-    update.message.reply_text(edit_phone_reply(phone),
-                              parse_mode=telegram.ParseMode.MARKDOWN,
-                              reply_markup=edit_phone_keyboard(phone))
+    app.queue.put((send_bot_message, {
+        'message': update.message,
+        'text': edit_phone_reply(phone),
+        'parse_mode': telegram.ParseMode.MARKDOWN,
+        'reply_markup': edit_phone_keyboard(phone)
+    }), timeout=10)
     return save_state(context, PHONE_EDIT)
 
 
@@ -844,9 +917,11 @@ def handle_edit_phone_property_query(update, context):
         'nick': 'псевдоним',
     }
     reply = property_ru.get(reply, reply)
-    update.callback_query.message.reply_text('Введи новый *{0}*:'.format(reply),
-                                             parse_mode=telegram.ParseMode.MARKDOWN,
-                                             reply_markup=telegram.ReplyKeyboardRemove())
+    app.queue.put((send_bot_message, {
+        'message': update.callback_query.message,
+        'text': 'Введи новый *{0}*:'.format(reply),
+        'parse_mode': telegram.ParseMode.MARKDOWN
+    }), timeout=10)
     return save_state(context, SET_PHONE_PROPERTY)
 
 
@@ -856,9 +931,12 @@ def handle_delete_phone_property_query(update, context):
     with lock:
         app.bot_persistence.state['phones'][phone]['replies'].pop(reply, None)
     app.bot_persistence.save_state()
-    update.callback_query.message.reply_text(edit_phone_reply(phone),
-                                             parse_mode=telegram.ParseMode.MARKDOWN,
-                                             reply_markup=edit_phone_keyboard(phone))
+    app.queue.put((send_bot_message, {
+        'message': update.callback_query.message,
+        'text': edit_phone_reply(phone),
+        'parse_mode': telegram.ParseMode.MARKDOWN,
+        'reply_markup': edit_phone_keyboard(phone)
+    }), timeout=10)
     return save_state(context, PHONE_EDIT)
 
 
@@ -872,18 +950,24 @@ def handle_set_phone_property(update, context):
         else:
             app.bot_persistence.state['phones'][phone]['replies'][reply] = text
     app.bot_persistence.save_state()
-    update.message.reply_text(edit_phone_reply(phone),
-                              parse_mode=telegram.ParseMode.MARKDOWN,
-                              reply_markup=edit_phone_keyboard(phone))
+    app.queue.put((send_bot_message, {
+        'message': update.message,
+        'text': edit_phone_reply(phone),
+        'parse_mode': telegram.ParseMode.MARKDOWN,
+        'reply_markup': edit_phone_keyboard(phone)
+    }), timeout=10)
     return save_state(context, PHONE_EDIT)
 
 
 def handle_edit_phone_query(update, context):
     phone = context.matches[0].group(1)
     context.chat_data['phone'] = phone
-    update.callback_query.message.reply_text(edit_phone_reply(phone),
-                                             parse_mode=telegram.ParseMode.MARKDOWN,
-                                             reply_markup=edit_phone_keyboard(phone))
+    app.queue.put((send_bot_message, {
+        'message': update.callback_query.message,
+        'text': edit_phone_reply(phone),
+        'parse_mode': telegram.ParseMode.MARKDOWN,
+        'reply_markup': edit_phone_keyboard(phone)
+    }), timeout=10)
     return save_state(context, PHONE_EDIT)
 
 
@@ -898,8 +982,12 @@ def handle_translate(update, context):
                                                                                callback_data='Отправить')]])
     else:
         text = 'Перевод такой же!'
-    update.message.reply_text(text, parse_mode=telegram.ParseMode.MARKDOWN,
-                              reply_markup=keyboard)
+    app.queue.put((send_bot_message, {
+        'message': update.message,
+        'text': text,
+        'parse_mode': telegram.ParseMode.MARKDOWN,
+        'reply_markup': keyboard
+    }), timeout=10)
     return SMS
 
 
@@ -1000,7 +1088,7 @@ if __name__ == "__main__":
             USERS: [CallbackQueryHandler(handle_add_user,
                                          pattern='^Добавить (оператора|администратора)$'),
                     CallbackQueryHandler(handle_back, pattern='^(Назад)$'),
-                    CallbackQueryHandler(handle_cancel, pattern='^(Выход)$'),
+                    CallbackQueryHandler(handle_cancel_query, pattern='^(Выход)$'),
                     CallbackQueryHandler(handle_del_user,
                                          pattern='^Удалить (.+)$')],
             NEW_USER: [MessageHandler(Filters.text, handle_set_user)],
@@ -1019,7 +1107,7 @@ if __name__ == "__main__":
                          CallbackQueryHandler(handle_back_query, pattern='^(Назад)$'),
                          CallbackQueryHandler(handle_cancel_query, pattern='^(Выход)$')]
         },
-        fallbacks=[CommandHandler('cancel', handle_cancel)]
+        fallbacks=[CommandHandler('cancel', handle_cancel_query)]
     )
     sms_handler = ConversationHandler(
         per_user=False,

@@ -25,15 +25,15 @@ class TgproovlWorker:
         while self._is_enabled:
             handler, update = self._queue.get()
             try:
-                result = handler(update)
-            except Exception:
-                result = False
-            if not result:
+                failed = not handler(update)
+            except Exception as exc:
+                failed = str(exc)
+            if failed:
                 attempt = update.get('try', 0)
                 attempt += 1
                 if attempt > 5:
-                    logger.error('Giving up doing task with type %s %s',
-                                 str(handler), update)
+                    logger.error('Giving up doing task with type %s %s %s',
+                                 str(handler), failed, update)
                 else:
                     update['try'] = attempt
                     self._queue.put((handler, update), timeout=self._timeout)
