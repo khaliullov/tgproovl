@@ -59,6 +59,9 @@ class ExtendedPersistence(PicklePersistence):
 
     def update_state(self, data):
         self.state = deepcopy(data)
+        self.save_state()
+
+    def save_state(self):
         if not self.on_flush:
             if not self.single_file:
                 filename = "{}_state".format(self.filename)

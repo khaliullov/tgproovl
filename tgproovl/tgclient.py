@@ -3,9 +3,10 @@ from typing import Optional, Type, Callable
 import sys
 
 from pytglib import VERSION
+from pytglib.api.utils import Object
 from pytglib.client import Telegram
 from pytglib.utils import AsyncResult
-from pytglib.worker import BaseWorker
+from pytglib.worker import BaseWorker, SimpleWorker
 
 
 logger = logging.getLogger(__name__)
@@ -15,6 +16,21 @@ handler.setLevel(logging.DEBUG)
 formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 handler.setFormatter(formatter)
 logger.addHandler(handler)
+
+
+class FixedWorker(SimpleWorker):
+    def _run_thread(self) -> None:
+        logger.info('[SimpleWorker] started')
+
+        while self._is_enabled:
+            handler, update = self._queue.get()
+            try:
+                new_update = Object.read(update)
+            except Exception:
+                handler(update)
+            else:
+                handler(new_update)
+            self._queue.task_done()
 
 
 class TgClient(Telegram):
@@ -39,6 +55,8 @@ class TgClient(Telegram):
             default_workers_queue_size=1000,
             tdlib_verbosity: int = 2,
     ) -> None:
+        if not worker:
+            worker = FixedWorker
         super(TgClient, self).__init__(api_id=api_id, api_hash=api_hash,
                                        database_encryption_key=database_encryption_key,
                                        phone=phone, bot_token=bot_token,

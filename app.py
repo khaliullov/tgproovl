@@ -3,9 +3,11 @@
 import copy
 import logging
 import os
+from queue import Queue
 import sys
 import time
 import traceback
+import threading
 
 from flask import Flask, request
 from flask_apscheduler import APScheduler
@@ -17,6 +19,7 @@ from telegram.ext import Dispatcher, CommandHandler, ConversationHandler,\
 
 from tgproovl.extendedpersistence import ExtendedPersistence
 from tgproovl.tgclient import TgClient
+from tgproovl.tgproovlworker import TgproovlWorker
 
 
 APP_CONFIG = os.environ.get('TGBOT_CONFIG', 'config.MainConfig')
@@ -49,12 +52,74 @@ app.human = TgClient(app.config['TELEGRAM_API_ID'],
                      database_encryption_key='abret' + app.config['TELEGRAM_PHONE'] + 'bgty',
                      system_version='Linux',
                      library_path='/tmp/td/tdlib/lib/libtdjson.so.1.5.0')
+lock = threading.Lock()
 logger = logging.getLogger(__name__)
+app.queue = Queue(maxsize=1000)
+app.worker = TgproovlWorker(app.queue)
 
 
 @app.route(app.config['APPLICATION_ROOT'] + 'healthcheck')
 def smoke_test():
     return 'OK'
+
+
+def remove_chat(update):
+    chat_id = update['chat_id']
+    receiver = update['receiver']
+    sender = update['sender']
+    result = app.human._send_data({'@type': 'searchChatMembers',
+                                   'limit': 100,
+                                   'chat_id': chat_id})
+    try:
+        result.wait(timeout=5)
+    except TimeoutError:
+        pass
+    if result.update and result.update.ID == 'chatMembers':
+        users = set()
+        for member in result.update.members:
+            users.add(member.user_id)
+        users.discard(app.bot_persistence.state['self'])
+        users.add(app.bot_persistence.state['self'])
+        error = False
+        for user_id in users:
+            result = app.human._send_data({
+                '@type': 'setChatMemberStatus',
+                'user_id': user_id,
+                'chat_id': chat_id,
+                'status': {'@type': 'chatMemberStatusLeft'}})
+            try:
+                result.wait(timeout=5)
+            except TimeoutError:
+                pass
+            if not result.update:
+                error = True
+                break
+        if not error:
+            with lock:
+                app.bot_persistence.state['phones'][receiver]['chats'].pop(sender, None)
+            app.bot_persistence.save_state()
+            return True
+    return False
+
+
+def send_bot_message(update):
+    message = update.get('message', None)
+    chat_id = update['chat_id']
+    text = update['text']
+    reply_to_message_id = update.get('reply_to_message_id', None)
+    parse_mode = update.get('parse_mode', None)
+    try:
+        if message:
+            pass
+        else:
+            app.bot.send_message(chat_id=chat_id, text=text,
+                                 parse_mode=parse_mode,
+                                 reply_to_message_id=reply_to_message_id)
+    except telegram.error.Unauthorized:
+        pass
+    except Exception:
+        pass  # TODO send to developer
+    return True
 
 
 @scheduler.task('interval', id='get_sms', seconds=10, coalesce=False)
@@ -63,104 +128,66 @@ def check_sms_and_chats():
     if not app.bot_persistence.state \
             or 'phones' not in app.bot_persistence.state \
             or 'sms' not in app.bot_persistence.state:
-        print('skipping SMS and Chats check')
+        logger.warn('skipping SMS and Chats check')
         return
-    print('Running SMS and Chats check')
+    logger.info('Running SMS and Chats check')
     for receiver in app.bot_persistence.state['phones']:
-        to_remove = []
         for sender in app.bot_persistence.state['phones'][receiver]['chats']:
-            chat = app.bot_persistence.state['phones'][receiver]['chats'][
-                sender]
-            if 'try' in chat and chat['try'] > 3:
-                to_remove.append(sender)
+            chat = app.bot_persistence.state['phones'][receiver]['chats'][sender]
             if chat['last_message'] + app.config['CHAT_HALF_TIMEOUT'] < now:
                 if 'try' not in chat:
-                    chat['try'] = 1
-                    try:
-                        app.bot.send_message(
-                            chat_id=chat['chat_id'],
-                            text='В чате давно не было новых сообщений. Жду ещё {0} секунд и закрываю'.format(
-                                app.config['CHAT_HALF_TIMEOUT']),
-                            parse_mode=telegram.ParseMode.MARKDOWN)
-                    except telegram.error.Unauthorized:
-                        to_remove.append(sender)
+                    with lock:
+                        chat['try'] = 1
+                    app.queue.put((send_bot_message, {
+                        'chat_id': chat['chat_id'],
+                        'text': 'В чате давно не было новых сообщений. Жду ещё {0} секунд и закрываю'.format(app.config['CHAT_HALF_TIMEOUT']),
+                        'parse_mode': telegram.ParseMode.MARKDOWN
+                    }), timeout=10)
                     continue
             if chat['last_message'] + app.config['CHAT_HALF_TIMEOUT'] * 2 < now:
-                result = app.human._send_data({'@type': 'searchChatMembers',
-                                               'limit': 100,
-                                               'chat_id': chat['chat_id']})
-                try:
-                    result.wait(timeout=5)
-                except TimeoutError:
-                    chat['try'] += 1
-                    continue
-                if result.update and result.update.ID == 'chatMembers':
-                    users = set()
-                    for member in result.update.members:
-                        users.add(member.user_id)
-                    users.discard(app.bot_persistence.state['self'])
-                    users.add(app.bot_persistence.state['self'])
-                    error = False
-                    for user_id in users:
-                        result = app.human._send_data({
-                            '@type': 'setChatMemberStatus',
-                            'user_id': user_id,
-                            'chat_id': chat['chat_id'],
-                            'status': {'@type': 'chatMemberStatusLeft'}})
-                        try:
-                            result.wait(timeout=5)
-                        except TimeoutError:
-                            pass
-                        if not result.update:
-                            error = True
-                            break
-                    if not error:
-                        to_remove.append(sender)
-                    else:
-                        chat['try'] += 1
-                else:
-                    chat['try'] += 1
-        for item in to_remove:
-            app.bot_persistence.state['phones'][receiver]['chats'].pop(item, None)
+                app.queue.put((remove_chat, {
+                    'chat_id': chat['chat_id'],
+                    'receiver': receiver,
+                    'sender': sender,
+                }), timeout=10)
     to_remove = []
     for _id in app.bot_persistence.state['sms']:
         sms = app.bot_persistence.state['sms'][_id]
         if sms['timestamp'] + app.config['SMS_HALF_TIMEOUT'] < now:
             if 'try' not in sms:
-                sms['try'] = 1
+                with lock:
+                    sms['try'] = 1
                 if ('incoming' not in app.bot_persistence.state['phones'][sms['from']]['chats'][sms['to']]
                     or app.bot_persistence.state['phones'][sms['from']]['chats'][sms['to']]['incoming'] < 2) \
                         and sms['status'] != 'Delivered':
                     if sms['to'] in app.bot_persistence.state['phones'][sms['from']]['chats']:
-                        try:
-                            app.bot.send_message(
-                                chat_id=app.bot_persistence.state['sms'][_id]['chat_id'],
-                                reply_to_message_id=sms['reply_to_message_id'],
-                                text="Сообщение до сих пор со статусом *{0}*".format(SMS_STATUS_RU.get(sms['status'], sms['status'])),
-                                parse_mode=telegram.ParseMode.MARKDOWN)
-                        except telegram.error.Unauthorized:
-                            to_remove.append(_id)
-                            continue
+                        app.queue.put((send_bot_message, {
+                            'chat_id': app.bot_persistence.state['sms'][_id]['chat_id'],
+                            'reply_to_message_id': sms['reply_to_message_id'],
+                            'text': 'Сообщение до сих пор со статусом *{0}*'.format(SMS_STATUS_RU.get(sms['status'], sms['status'])),
+                            'parse_mode': telegram.ParseMode.MARKDOWN
+                        }), timeout=10)
         if sms['timestamp'] + app.config['SMS_HALF_TIMEOUT'] * 2 < now:
             to_remove.append(_id)
     for item in to_remove:
-        app.bot_persistence.state['sms'].pop(item, None)
-    app.bot_persistence.update_state(app.bot_persistence.state)
-    print('state:')
-    print(app.bot_persistence.state)
-    print('SMS and Chats check ended')
+        with lock:
+            app.bot_persistence.state['sms'].pop(item, None)
+    app.bot_persistence.save_state()
+    logger.debug('state: %s', app.bot_persistence.state)
+    logger.info('SMS and Chats check ended')
 
 
 def init_receiver(phone):
     if phone not in app.bot_persistence.state['phones']:
-        app.bot_persistence.state['phones'][phone] = {
-            'nick': phone,
-            'site': '',
-            'regulars': {},
-            'replies': {},
-            'chats': {},
-        }
-        app.bot_persistence.update_state(app.bot_persistence.state)
+        with lock:
+            app.bot_persistence.state['phones'][phone] = {
+                'nick': phone,
+                'site': '',
+                'regulars': {},
+                'replies': {},
+                'chats': {},
+            }
+        app.bot_persistence.save_state()
 
 
 def send_sms(_from, to, text, tariff=app.config['PROOVL_TARIFF']):
@@ -193,6 +220,138 @@ def esc_yml(text):
     })
 
 
+def process_status(update):
+    token = update.get('token', None)
+    _from = update.get('from', None)
+    _id = update.get('id', None)
+    to = update.get('to', None)
+    text = update.get('text', None)
+    status = update.get('status', None)
+    if _id in app.bot_persistence.state['sms'] \
+            and app.bot_persistence.state['sms'][_id]['to'] in \
+            app.bot_persistence.state['phones'][
+                app.bot_persistence.state['sms'][_id]['from']]['chats']:
+        app.bot.edit_message_text(
+            chat_id=app.bot_persistence.state['sms'][_id]['chat_id'],
+            message_id=app.bot_persistence.state['sms'][_id]['message_id'],
+            text='Сообщение *{0}* доставлено со статусом *{1}*'.format(
+                esc_yml(_id),
+                esc_yml(SMS_STATUS_RU.get(status, status))),
+            parse_mode=telegram.ParseMode.MARKDOWN
+        )
+        with lock:
+            app.bot_persistence.state['sms'][_id]['status'] = status
+            app.bot_persistence.state['sms'][_id]['timestamp'] = int(time.time())
+        if status != 'Delivered' and app.bot_persistence.state['sms'][_id]['tariff'] == 2:
+            sms = copy.copy(app.bot_persistence.state['sms'][_id])
+            res = app.bot.send_message(
+                chat_id=app.bot_persistence.state['sms'][_id]['chat_id'],
+                text="Отравка сообщения \"*{0}*\""
+                     " провалилась со статусом *{1}*.\n"
+                     "Пробую отправить с более дорогим тарифом".format(esc_yml(sms['text']), esc_yml(SMS_STATUS_RU.get(status, status))),
+                parse_mode=telegram.ParseMode.MARKDOWN)
+            with lock:
+                app.bot_persistence.state['sms'].pop(_id, None)
+                sms['tariff'] = 1
+                app.bot_persistence.state['phones'][sms['from']]['chats'][sms['to']]['tariff'] = 1
+            status, message_id = send_sms(sms['from'], sms['to'], sms['text'], 1)
+            res = app.bot.send_message(chat_id=sms['chat_id'],
+                                       reply_to_message_id=res.message_id,
+                                       text='Сообщение *{0}* отправлено со статусом *{1}*'.
+                                       format(esc_yml(message_id), esc_yml(SMS_STATUS_RU.get(status, status))),
+                                       parse_mode=telegram.ParseMode.MARKDOWN)
+            with lock:
+                sms['message_id'] = res.message_id
+                sms['remote_id'] = message_id
+                sms['status'] = status
+                app.bot_persistence.state['sms'][message_id] = sms
+        app.bot_persistence.save_state()
+    else:
+        print('Unknown message ID {0} updated with state {1}'.format(_id, status))
+    return True
+
+
+def process_incoming_sms(update):
+    token = update.get('token', None)
+    _from = update.get('from', None)
+    _id = update.get('id', None)
+    to = update.get('to', None)
+    text = update.get('text', None)
+    status = update.get('status', None)
+    init_state()
+    init_receiver(to)
+    translation = app.translator.translate(text, dest='ru')
+    if translation.text != text:
+        text = "_{0}_\nПеревод (c *{1}* на ru): *{2}*".format(esc_yml(text), esc_yml(translation.src), esc_yml(translation.text))
+    else:
+        text = '*{0}*'.format(esc_yml(text))
+    if _from not in app.bot_persistence.state['phones'][to]['chats']:
+        users = set([app.bot_persistence.state['bot_id']])
+        nicks = set([app.bot_persistence.state['bot_username']])
+        for user_id in app.bot_persistence.state['operators'].keys():
+            nicks.add(app.bot_persistence.state['operators'][user_id]['username'])
+            users.add(user_id)
+        users.discard(app.bot_persistence.state['self'])
+        user_ids = [app.bot_persistence.state['self']]
+        user_ids.extend(users)
+        for nick in nicks:
+            result = app.human._send_data({'@type': 'searchPublicChat',
+                                           'username': '@{0}'.format(nick)})
+            try:
+                result.wait(timeout=5)
+            except TimeoutError:
+                pass
+        for user in user_ids:
+            result = app.human._send_data({'@type': 'getUser',
+                                           'user_id': user})
+            try:
+                result.wait(timeout=5)
+            except TimeoutError:
+                pass
+        title = '{0} → {1}'.format(_from, to)
+        result = app.human._send_data({'@type': 'createNewBasicGroupChat',
+                                       'title': title,
+                                       'user_ids': user_ids})
+        try:
+            result.wait(timeout=5)
+        except TimeoutError:
+            pass
+        if result.update and result.update['@type'] == 'chat':
+            with lock:
+                app.bot_persistence.state['phones'][to]['chats'][_from] = {
+                    'last_message': int(time.time()),
+                    'tariff': app.config['PROOVL_TARIFF'],
+                    'incoming': 1,
+                    'message': text,
+                }
+                app.bot_persistence.state['phones'][to]['chats'][_from]['chat_id'] = result.update['id']
+            app.bot_persistence.save_state()
+            app.human._send_data({'@type': 'setChatDescription',
+                                  'chat_id': result.update['id'],
+                                  'description': title})
+        else:
+            app.queue.put((send_bot_message, {
+                'chat_id': app.config['TELEGRAM_DEVELOPER'],
+                'text': "Ошибка создания канала!\nСообщение от *{0}* для *{1}*\n{2}".format(esc_yml(_from), esc_yml(to), text),
+                'parse_mode': telegram.ParseMode.MARKDOWN
+            }), timeout=10)
+    else:
+        with lock:
+            app.bot_persistence.state['phones'][to]['chats'][_from]['last_message'] = int(time.time())
+            app.bot_persistence.state['phones'][to]['chats'][_from].pop('try', None)
+            if 'incoming' in app.bot_persistence.state['phones'][to]['chats'][_from]:
+                app.bot_persistence.state['phones'][to]['chats'][_from]['incoming'] += 1
+            else:
+                app.bot_persistence.state['phones'][to]['chats'][_from]['incoming'] = 1
+        app.bot_persistence.save_state()
+        app.queue.put((send_bot_message, {
+            'chat_id': app.bot_persistence.state['phones'][to]['chats'][_from]['chat_id'],
+            'text': text,
+            'parse_mode': telegram.ParseMode.MARKDOWN
+        }), timeout=10)
+    return True
+
+
 @app.route(app.config['APPLICATION_ROOT'] + 'incoming_sms', methods=['POST'])
 def proovl_webhook():
     token = request.values.get('token')
@@ -201,115 +360,19 @@ def proovl_webhook():
     to = request.values.get('to')
     text = request.values.get('text')
     status = request.values.get('status')
-    print(token, _from, _id, to, text, status)
+    logger.debug('From: %s, to: %s, msg_id: %s, status: %s, text: %s', _from, _id, to, text, status)
+    payload = {
+        'token': token,
+        'from': _from,
+        'to': to,
+        'text': text,
+        'status': status,
+        'id': _id,
+    }
     if status:
-        if _id in app.bot_persistence.state['sms'] \
-                and app.bot_persistence.state['sms'][_id]['to'] in \
-                app.bot_persistence.state['phones'][app.bot_persistence.state['sms'][_id]['from']]['chats']:
-            app.bot.edit_message_text(
-                chat_id=app.bot_persistence.state['sms'][_id]['chat_id'],
-                message_id=app.bot_persistence.state['sms'][_id]['message_id'],
-                text='Сообщение *{0}* доставлено со статусом *{1}*'.format(esc_yml(_id),
-                                                                           esc_yml(status)),
-                parse_mode=telegram.ParseMode.MARKDOWN
-            )
-            app.bot_persistence.state['sms'][_id]['status'] = status
-            app.bot_persistence.state['sms'][_id]['timestamp'] = int(time.time())
-            if status != 'Delivered' and app.bot_persistence.state['sms'][_id]['tariff'] == 2:
-                sms = copy.copy(app.bot_persistence.state['sms'][_id])
-                res = app.bot.send_message(chat_id=app.bot_persistence.state['sms'][_id]['chat_id'],
-                                           text="Отравка сообщения \"*{0}*\""
-                                                " провалилась со статусом *{1}*.\n"
-                                                "Пробую отправить с более дорогим тарифом".format(esc_yml(sms['text']),
-                                                                                                  esc_yml(SMS_STATUS_RU.get(status, status))),
-                                           parse_mode=telegram.ParseMode.MARKDOWN)
-                app.bot_persistence.state['sms'].pop(_id, None)
-                sms['tariff'] = 1
-                app.bot_persistence.state['phones'][sms['from']]['chats'][sms['to']]['tariff'] = 1
-                status, message_id = send_sms(sms['from'], sms['to'], sms['text'], 1)
-                res = app.bot.send_message(chat_id=sms['chat_id'], reply_to_message_id=res.message_id,
-                                           text='Сообщение *{0}* отправлено со статусом *{1}*'.
-                                           format(esc_yml(message_id), esc_yml(SMS_STATUS_RU.get(status, status))),
-                                           parse_mode=telegram.ParseMode.MARKDOWN)
-                sms['message_id'] = res.message_id
-                sms['remote_id'] = message_id
-                sms['status'] = status
-                app.bot_persistence.state['sms'][message_id] = sms
-            app.bot_persistence.update_state(app.bot_persistence.state)
-        else:
-            print('Unknown message ID {0} updated with state {1}'.format(_id, status))
+        app.queue.put((process_status, payload), timeout=10)
     else:
-        init_state()
-        init_receiver(to)
-        translation = app.translator.translate(text, dest='ru')
-        if translation.text != text:
-            text = "_{0}_\n"\
-                   "Перевод (c *{1}* на ru): *{2}*".format(esc_yml(text),
-                                                           esc_yml(translation.src),
-                                                           esc_yml(translation.text))
-        else:
-            text = '*{0}*'.format(esc_yml(text))
-        if _from not in app.bot_persistence.state['phones'][to]['chats']:
-            users = set([app.bot_persistence.state['bot_id']])
-            nicks = set([app.bot_persistence.state['bot_username']])
-            for user_id in app.bot_persistence.state['operators'].keys():
-                nicks.add(app.bot_persistence.state['operators'][user_id]['username'])
-                users.add(user_id)
-            users.discard(app.bot_persistence.state['self'])
-            user_ids = [app.bot_persistence.state['self']]
-            user_ids.extend(users)
-            for nick in nicks:
-                result = app.human._send_data({'@type': 'searchPublicChat',
-                                               'username': '@{0}'.format(nick)})
-                try:
-                    result.wait(timeout=5)
-                except TimeoutError:
-                    pass
-            for user in user_ids:
-                result = app.human._send_data({'@type': 'getUser',
-                                               'user_id': user})
-                try:
-                    result.wait(timeout=5)
-                except TimeoutError:
-                    pass
-            title = '{0} → {1}'.format(_from, to)
-            result = app.human._send_data({'@type': 'createNewBasicGroupChat',
-                                           'title': title,
-                                           'user_ids': user_ids})
-            try:
-                result.wait(timeout=5)
-            except TimeoutError:
-                pass
-            if result.update and result.update['@type'] == 'chat':
-                app.bot_persistence.state['phones'][to]['chats'][_from] = {
-                    'last_message': int(time.time()),
-                    'tariff': app.config['PROOVL_TARIFF'],
-                    'incoming': 1,
-                    'message': text,
-                }
-                app.bot_persistence.state['phones'][to]['chats'][_from]['chat_id'] = result.update['id']
-                app.human._send_data({'@type': 'setChatDescription',
-                                      'chat_id': result.update['id'],
-                                      'description': title})
-            else:
-                app.bot.send_message(chat_id=app.config['TELEGRAM_DEVELOPER'],
-                                     text="Ошибка создания канала!\n"
-                                          "Сообщение от *{0}* для *{1}*\n"
-                                          "{2}".format(esc_yml(_from),
-                                                       esc_yml(to),
-                                                       text),
-                                     parse_mode=telegram.ParseMode.MARKDOWN)
-        else:
-            app.bot_persistence.state['phones'][to]['chats'][_from]['last_message'] = int(time.time())
-            app.bot_persistence.state['phones'][to]['chats'][_from].pop('try', None)
-            if 'incoming' in app.bot_persistence.state['phones'][to]['chats'][_from]:
-                app.bot_persistence.state['phones'][to]['chats'][_from]['incoming'] += 1
-            else:
-                app.bot_persistence.state['phones'][to]['chats'][_from]['incoming'] = 1
-            app.bot.send_message(chat_id=app.bot_persistence.state['phones'][to]['chats'][_from]['chat_id'],
-                                 text=text,
-                                 parse_mode=telegram.ParseMode.MARKDOWN)
-        app.bot_persistence.update_state(app.bot_persistence.state)
+        app.queue.put((process_incoming_sms, payload), timeout=10)
     return 'OK'
 
 
@@ -317,7 +380,7 @@ def proovl_webhook():
            methods=['POST'])
 def telegram_webhook():
     payload = request.get_json(force=True)
-    print(payload)
+    logger.debug('Webhook payload: %s', payload)
     update = telegram.update.Update.de_json(payload, app.bot)
     app.dispatcher.process_update(update)
     return 'OK'
@@ -386,12 +449,13 @@ def handle_password(update, context):
         app.bot.deleteMessage(chat_id=update.message.chat.id,
                               message_id=update.message.message_id)
         user = update.message.from_user
-        app.bot_persistence.state['admins'][user.id] = {
-            'id': user.id,
-            'name': user.first_name,
-            'username': user.username
-        }
-        app.bot_persistence.update_state(app.bot_persistence.state)
+        with lock:
+            app.bot_persistence.state['admins'][user.id] = {
+                'id': user.id,
+                'name': user.first_name,
+                'username': user.username
+            }
+        app.bot_persistence.save_state()
         update.message.reply_text('Привет, {0}'.format(user.first_name),
                                   reply_markup=menu_keyboard(context))
         return save_state(context, CONFIG)
@@ -530,10 +594,10 @@ def handle_set_user(update, context):
         if user['id'] in app.bot_persistence.state[state_field]:
             result = 'Пользователь с ником {0} уже {1}'.format(nick, user_type)
         else:
-            app.bot_persistence.state[state_field][user['id']] = user
-            result = 'Пользователь с ником {0} теперь {1}!'.format(nick,
-                                                                   user_type)
-            app.bot_persistence.update_state(app.bot_persistence.state)
+            result = 'Пользователь с ником {0} теперь {1}!'.format(nick, user_type)
+            with lock:
+                app.bot_persistence.state[state_field][user['id']] = user
+            app.bot_persistence.save_state()
     update.message.reply_text(result, reply_markup=user_keyboard(context))
     return save_state(context, USERS)
 
@@ -557,8 +621,9 @@ def handle_del_user(update, context):
     if app.bot_persistence.state['self'] == user_id:
         result = 'Нельзя удалить основного {0}а'.format(user_type)
     else:
-        app.bot_persistence.state[state_field].pop(user_id, None)
-        app.bot_persistence.update_state(app.bot_persistence.state)
+        with lock:
+            app.bot_persistence.state[state_field].pop(user_id, None)
+        app.bot_persistence.save_state()
         result = '{0} больше не {1}!'.format(nick, user_type)
     update.callback_query.message.reply_text(result, reply_markup=user_keyboard(context))
     return save_state(context, USERS)
@@ -575,27 +640,28 @@ def handle_chat_start(update, context):
     context.chat_data['chat_id'] = update.message.chat.id
     chat = app.bot.get_chat(context.chat_data['chat_id'])
     title = chat.description or update.message.chat.title
+    if not chat.description:
+        app.human._send_data({'@type': 'setChatDescription',
+                              'chat_id': context.chat_data['chat_id'],
+                              'description': title})
     context.chat_data['sender'] = title.split(' ')[0]
     context.chat_data['receiver'] = title.split(' ')[-1]
     init_receiver(context.chat_data['receiver'])
-    if context.chat_data['sender'] in \
-            app.bot_persistence.state['phones'][context.chat_data['receiver']]['regulars']:
-        app.bot_persistence.state['phones'][context.chat_data['receiver']]['regulars'][context.chat_data['sender']] += 1
-    else:
-        app.bot_persistence.state['phones'][context.chat_data['receiver']]['regulars'][context.chat_data['sender']] = 1
-    if context.chat_data['sender'] not in \
-            app.bot_persistence.state['phones'][context.chat_data['receiver']]['chats']:
-        app.bot_persistence.state['phones'][context.chat_data[
-            'receiver']]['chats'][context.chat_data['sender']] = {}
-    app.bot_persistence.state['phones'][context.chat_data[
-        'receiver']]['chats'][context.chat_data['sender']].update({
-        'chat_id': context.chat_data['chat_id'],
-        'sender': context.chat_data['sender'],
-        'receiver': context.chat_data['receiver'],
-        'last_message': int(time.time()),
-        'tariff': app.config['PROOVL_TARIFF'],
-    })
-    app.bot_persistence.update_state(app.bot_persistence.state)
+    with lock:
+        if context.chat_data['sender'] in app.bot_persistence.state['phones'][context.chat_data['receiver']]['regulars']:
+            app.bot_persistence.state['phones'][context.chat_data['receiver']]['regulars'][context.chat_data['sender']] += 1
+        else:
+            app.bot_persistence.state['phones'][context.chat_data['receiver']]['regulars'][context.chat_data['sender']] = 1
+        if context.chat_data['sender'] not in app.bot_persistence.state['phones'][context.chat_data['receiver']]['chats']:
+            app.bot_persistence.state['phones'][context.chat_data['receiver']]['chats'][context.chat_data['sender']] = {}
+        app.bot_persistence.state['phones'][context.chat_data['receiver']]['chats'][context.chat_data['sender']].update({
+            'chat_id': context.chat_data['chat_id'],
+            'sender': context.chat_data['sender'],
+            'receiver': context.chat_data['receiver'],
+            'last_message': int(time.time()),
+            'tariff': app.config['PROOVL_TARIFF'],
+        })
+    app.bot_persistence.save_state()
     text = 'Абоненту: *{0}*'.format(esc_yml(context.chat_data['receiver']))
     if app.bot_persistence.state['phones'][context.chat_data['receiver']]['nick'] != context.chat_data['receiver']:
         app.human._send_data({'@type': 'setChatTitle',
@@ -622,7 +688,9 @@ def handle_chat_start(update, context):
         app.bot.send_message(chat_id=context.chat_data['chat_id'],
                              parse_mode=telegram.ParseMode.MARKDOWN,
                              text=app.bot_persistence.state['phones'][context.chat_data['receiver']]['chats'][context.chat_data['sender']]['message'])
-        app.bot_persistence.state['phones'][context.chat_data['receiver']]['chats'][context.chat_data['sender']].pop('message', None)
+        with lock:
+            app.bot_persistence.state['phones'][context.chat_data['receiver']]['chats'][context.chat_data['sender']].pop('message', None)
+        app.bot_persistence.save_state()
     return save_state(context, SMS)
 
 
@@ -657,8 +725,9 @@ def real_handle_sms(message, context):
         'tariff': tariff,
         'timestamp': int(time.time()),
     }
-    app.bot_persistence.state['phones'][context.chat_data['receiver']]['chats'][context.chat_data['sender']]['last_message'] = int(time.time())
-    app.bot_persistence.state['phones'][context.chat_data['receiver']]['chats'][context.chat_data['sender']].pop('try', None)
+    with lock:
+        app.bot_persistence.state['phones'][context.chat_data['receiver']]['chats'][context.chat_data['sender']]['last_message'] = int(time.time())
+        app.bot_persistence.state['phones'][context.chat_data['receiver']]['chats'][context.chat_data['sender']].pop('try', None)
     status, message_id = send_sms(context.chat_data['receiver'],
                                   context.chat_data['sender'],
                                   message.text, tariff)
@@ -671,10 +740,9 @@ def real_handle_sms(message, context):
         sms['status'] = status
         sms['message_id'] = res.message_id
         sms['reply_to_message_id'] = message.message_id
-        app.bot_persistence.state['sms'][message_id] = sms
-        app.bot_persistence.update_state(app.bot_persistence.state)
-    print('state:')
-    print(app.bot_persistence.state)
+        with lock:
+            app.bot_persistence.state['sms'][message_id] = sms
+    app.bot_persistence.save_state()
     return SMS
 
 
@@ -776,8 +844,9 @@ def handle_edit_phone_property_query(update, context):
 def handle_delete_phone_property_query(update, context):
     reply = context.matches[0].group(1)
     phone = context.chat_data['phone']
-    app.bot_persistence.state['phones'][phone]['replies'].pop(reply, None)
-    app.bot_persistence.update_state(app.bot_persistence.state)
+    with lock:
+        app.bot_persistence.state['phones'][phone]['replies'].pop(reply, None)
+    app.bot_persistence.save_state()
     update.callback_query.message.reply_text(edit_phone_reply(phone),
                                              parse_mode=telegram.ParseMode.MARKDOWN,
                                              reply_markup=edit_phone_keyboard(phone))
@@ -788,11 +857,12 @@ def handle_set_phone_property(update, context):
     text = update.message.text
     phone = context.chat_data['phone']
     reply = context.chat_data['reply']
-    if reply in ['site', 'nick']:
-        app.bot_persistence.state['phones'][phone][reply] = text
-    else:
-        app.bot_persistence.state['phones'][phone]['replies'][reply] = text
-    app.bot_persistence.update_state(app.bot_persistence.state)
+    with lock:
+        if reply in ['site', 'nick']:
+            app.bot_persistence.state['phones'][phone][reply] = text
+        else:
+            app.bot_persistence.state['phones'][phone]['replies'][reply] = text
+    app.bot_persistence.save_state()
     update.message.reply_text(edit_phone_reply(phone),
                               parse_mode=telegram.ParseMode.MARKDOWN,
                               reply_markup=edit_phone_keyboard(phone))
@@ -967,5 +1037,6 @@ if __name__ == "__main__":
     app.human._send_encryption_key()
     scheduler.init_app(app)
     scheduler.start()
+    app.worker.run()
     app.run(host=app.config['FLASK_RUN_HOST'],
             port=app.config['FLASK_RUN_PORT'])
