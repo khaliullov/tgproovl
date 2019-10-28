@@ -95,9 +95,18 @@ def remove_chat(update):
                 error = True
                 break
         if not error:
-            with lock:
-                app.bot_persistence.state['phones'][receiver]['chats'].pop(sender, None)
-            app.bot_persistence.save_state()
+            result = app.human._send_data({
+                '@type': 'deleteChatHistory',
+                'chat_id': chat_id,
+                'remove_from_chat_list': 1})
+            try:
+                result.wait(timeout=5)
+            except TimeoutError:
+                pass
+            if not result.update:
+                with lock:
+                    app.bot_persistence.state['phones'][receiver]['chats'].pop(sender, None)
+                app.bot_persistence.save_state()
             return True
     return False
 
