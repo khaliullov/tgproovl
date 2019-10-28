@@ -78,8 +78,9 @@ def remove_chat(update):
         users = set()
         for member in result.update.members:
             users.add(member.user_id)
-        users.discard(app.bot_persistence.state['self'])
-        users.add(app.bot_persistence.state['self'])
+        if app.bot_persistence.state['self'] in users:
+            users.discard(app.bot_persistence.state['self'])
+            users.add(app.bot_persistence.state['self'])
         error = False
         for user_id in users:
             result = app.human._send_data({
@@ -103,10 +104,16 @@ def remove_chat(update):
                 result.wait(timeout=5)
             except TimeoutError:
                 pass
-            if not result.update:
+            if result.update:
                 with lock:
                     app.bot_persistence.state['phones'][receiver]['chats'].pop(sender, None)
                 app.bot_persistence.save_state()
+            return True
+    else:
+        if result.error == True and result.error_info['message'] == 'Chat not found':
+            with lock:
+                app.bot_persistence.state['phones'][receiver]['chats'].pop(sender, None)
+            app.bot_persistence.save_state()
             return True
     return False
 
@@ -288,6 +295,20 @@ def process_status(update):
     return True
 
 
+def sms_reply_keyboard(receiver):
+    keyboard = []
+    buttons = []
+    for reply in app.bot_persistence.state['phones'][receiver]['replies']:
+        buttons.append(telegram.InlineKeyboardButton(reply,
+                                                     callback_data=reply))
+        if len(buttons) >= 2:
+            keyboard.append(buttons)
+            buttons = []
+    if len(buttons) > 0:
+        keyboard.append(buttons)
+    return telegram.InlineKeyboardMarkup(keyboard)
+
+
 def process_incoming_sms(update):
     token = update.get('token', None)
     _from = update.get('from', None)
@@ -364,6 +385,7 @@ def process_incoming_sms(update):
         app.queue.put((send_bot_message, {
             'chat_id': app.bot_persistence.state['phones'][to]['chats'][_from]['chat_id'],
             'text': text,
+            'reply_markup': sms_reply_keyboard(to),
             'parse_mode': telegram.ParseMode.MARKDOWN
         }), timeout=10)
     return True
@@ -750,7 +772,8 @@ def handle_chat_start(update, context):
         app.queue.put((send_bot_message, {
             'chat_id': context.chat_data['chat_id'],
             'text': app.bot_persistence.state['phones'][context.chat_data['receiver']]['chats'][context.chat_data['sender']]['message'],
-            'parse_mode': telegram.ParseMode.MARKDOWN
+            'parse_mode': telegram.ParseMode.MARKDOWN,
+            'reply_markup': sms_reply_keyboard(context.chat_data['receiver']),
         }), timeout=10)
         with lock:
             app.bot_persistence.state['phones'][context.chat_data['receiver']]['chats'][context.chat_data['sender']].pop('message', None)
@@ -814,7 +837,27 @@ def real_handle_sms(message, context):
 
 
 def handle_send_translate_query(update, context):
-    return real_handle_sms(update.callback_query.message, context)
+    command = context.matches[0].group(1)
+    if command == 'Отправить':
+        text = update.callback_query.message.text
+    elif command in app.bot_persistence.state['phones'][context.chat_data['receiver']]['replies']:
+        text = app.bot_persistence.state['phones'][context.chat_data['receiver']]['replies'][command]
+    else:
+        app.queue.put((send_bot_message, {
+            'message': 'Неизвестная команда',
+            'text': 'Введи новый номер телефона (например, 33666555777):'
+        }), timeout=10)
+        return SMS
+    app.human._send_data({'@type': 'sendMessage',
+                          'chat_id': context.chat_data['chat_id'],
+                          'input_message_content': {
+                              '@type': 'inputMessageText',
+                              'text': {
+                                  '@type': 'formattedText',
+                                  'text': text
+                              }
+                          }})
+    return SMS
 
 
 def handle_add_phone_query(update, context):
@@ -979,7 +1022,7 @@ def handle_translate(update, context):
     if translation.text != text:
         text = '*{1}*'.format(translation.dest, translation.text)
         keyboard = telegram.InlineKeyboardMarkup([[telegram.InlineKeyboardButton('Отправить',
-                                                                               callback_data='Отправить')]])
+                                                                                 callback_data='Отправить')]])
     else:
         text = 'Перевод такой же!'
     app.queue.put((send_bot_message, {
@@ -1116,7 +1159,7 @@ if __name__ == "__main__":
         states={
             SMS: [MessageHandler(Filters.text, handle_sms),
                   CallbackQueryHandler(handle_send_translate_query,
-                                       pattern='^(Отправить)$'),
+                                       pattern='^(.+)$'),
                   CommandHandler(['fr', 'en', 'de'], handle_translate)],
         },
         fallbacks=[MessageHandler(Filters.status_update.left_chat_member, handle_chat_stop)]
