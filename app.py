@@ -1134,6 +1134,7 @@ if __name__ == "__main__":
     app.human._send_encryption_key()
     scheduler.init_app(app)
     scheduler.start()
+    app.worker.set_error_handler(send_bot_message, {'chat_id': app.config['TELEGRAM_DEVELOPER']})
     app.worker.run()
     app.run(host=app.config['FLASK_RUN_HOST'],
             port=app.config['FLASK_RUN_PORT'])

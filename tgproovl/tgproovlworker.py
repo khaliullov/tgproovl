@@ -13,11 +13,20 @@ class TgproovlWorker:
         self._is_enabled = True
         self._queue = queue
         self._timeout = timeout
+        self._error_handler = None
+        self._error_template = {}
 
     def run(self) -> None:
         self._thread = threading.Thread(target=self._run_thread)    # pylint: disable=attribute-defined-outside-init
         self._thread.daemon = True
         self._thread.start()
+
+    def set_error_handler(self, handler, template):
+        if handler and len(template):
+            self._error_handler = handler
+            self._error_template = template
+        else:
+            raise ValueError('wrong args to error_handler')
 
     def _run_thread(self) -> None:
         logger.info('[TgproovlWorker] started')
@@ -32,8 +41,13 @@ class TgproovlWorker:
                 attempt = update.get('try', 0)
                 attempt += 1
                 if attempt > 5:
-                    logger.error('Giving up doing task with type %s %s %s',
-                                 str(handler), failed, update)
+                    text = 'Giving up doing task with type {0} {1} {2}'.format(str(handler), failed, update)
+                    if self._error_handler and len(self._error_template):
+                        update = dict(self._error_template)
+                        update['text'] = text
+                        self._queue.put((self._error_handler, update),
+                                        timeout=self._timeout)
+                    logger.error(text)
                 else:
                     update['try'] = attempt
                     self._queue.put((handler, update), timeout=self._timeout)
