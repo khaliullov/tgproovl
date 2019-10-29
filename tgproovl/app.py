@@ -17,12 +17,18 @@ import telegram
 from telegram.ext import Dispatcher, CommandHandler, ConversationHandler,\
     MessageHandler, Filters, CallbackQueryHandler
 
-from tgproovl.extendedpersistence import ExtendedPersistence
-from tgproovl.tgclient import TgClient
-from tgproovl.tgproovlworker import TgproovlWorker
+try:
+    from extendedpersistence import ExtendedPersistence
+    from tgclient import TgClient
+    from tgproovlworker import TgproovlWorker
+    APP_CONFIG = os.environ.get('TGBOT_CONFIG', 'config.MainConfig')
+except ModuleNotFoundError:
+    from tgproovl.extendedpersistence import ExtendedPersistence
+    from tgproovl.tgclient import TgClient
+    from tgproovl.tgproovlworker import TgproovlWorker
+    APP_CONFIG = os.environ.get('TGBOT_CONFIG', 'tgproovl.config.MainConfig')
 
 
-APP_CONFIG = os.environ.get('TGBOT_CONFIG', 'config.MainConfig')
 PASSWORD, CONFIG, USERS, NEW_USER, SMS, PHONES_MENU, NEW_PHONE, PHONE_EDIT,\
     NEW_REPLY, SET_PHONE_PROPERTY = range(10)
 SMS_STATUS_RU = {
@@ -1113,7 +1119,7 @@ def handle_error(update, context):
                          parse_mode=telegram.ParseMode.MARKDOWN)
 
 
-if __name__ == "__main__":
+def main():
     conv_handler = ConversationHandler(
         entry_points=[CommandHandler('start', start)],
         states={
@@ -1179,5 +1185,9 @@ if __name__ == "__main__":
     scheduler.start()
     app.worker.set_error_handler(send_bot_message, {'chat_id': app.config['TELEGRAM_DEVELOPER']})
     app.worker.run()
+
+
+main()
+if __name__ == "__main__":
     app.run(host=app.config['FLASK_RUN_HOST'],
-            port=app.config['FLASK_RUN_PORT'])
+            port=app.config['FLASK_RUN_PORT'], threaded=True)

@@ -31,7 +31,7 @@ run: venv/bin/python .env
 	TGPROOVL_TELEGRAM_OWNER=$(TGPROOVL_TELEGRAM_OWNER) \
 	TGPROOVL_TELEGRAM_API_ID=$(TGPROOVL_TELEGRAM_API_ID) \
 	TGPROOVL_TELEGRAM_API_HASH=$(TGPROOVL_TELEGRAM_API_HASH) \
-		./venv/bin/python app.py
+		./venv/bin/python ./tgproovl/app.py
 
 clean:
 	rm -rf venv
