@@ -7,7 +7,7 @@ node {
     }
 
     stage('Build image') {
-        image = "${env.REGISTRY}/${env.GITHUB_REPOSITORY}:0.0.1"
+        image = "${env.REGISTRY}".replace("https://", "") + "/${env.GITHUB_REPOSITORY}:0.0.1"
         app = docker.build(image)
     }
 
