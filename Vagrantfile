@@ -8,8 +8,7 @@ DOCKER_PORTS = [ '8080:8080' ]
 
 Vagrant.configure('2') do |config|
   config.vm.provider "docker" do |d|
-    d.build_dir = '.'
-    d.build_args = [ '-t', 'registry.localix.ru/tgproovl:0.0.1' ]
+    d.image = 'leandr/python-tdlib:3.8.0'
     d.ports = DOCKER_PORTS
     d.force_host_vm = false
     d.has_ssh = true

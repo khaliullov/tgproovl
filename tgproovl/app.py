@@ -57,7 +57,7 @@ app.human = TgClient(app.config['TELEGRAM_API_ID'],
                      phone=app.config['TELEGRAM_PHONE'],
                      database_encryption_key='abret' + app.config['TELEGRAM_PHONE'] + 'bgty',
                      system_version='Linux',
-                     library_path='/tmp/td/tdlib/lib/libtdjson.so.1.5.0')
+                     library_path='/usr/lib/libtdjson.so.1.5.1')
 lock = threading.Lock()
 logger = logging.getLogger(__name__)
 app.queue = Queue(maxsize=1000)
