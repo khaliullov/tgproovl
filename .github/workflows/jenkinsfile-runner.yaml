@@ -6,7 +6,7 @@ jobs:
     steps:
     - uses: actions/checkout@master
     - name: jenkinsfile-runner-prepackaged
-      uses: jenkinsci/jenkinsfile-runner-github-actions/jenkinsfile-runner-prepackaged@master
+      uses: khaliullov/jenkinsfile-runner-github-actions/jenkinsfile-runner-prepackaged@master
       env:
         REGISTRY: ${{ secrets.REGISTRY }}
         REGISTRY_USERNAME: ${{ secrets.REGISTRY_USERNAME }}
