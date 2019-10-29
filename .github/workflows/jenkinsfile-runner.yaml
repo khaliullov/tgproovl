@@ -8,4 +8,6 @@ jobs:
     - name: jenkinsfile-runner-prepackaged
       uses: jenkinsci/jenkinsfile-runner-github-actions/jenkinsfile-runner-prepackaged@master
       env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        REGISTRY: ${{ secrets.REGISTRY }}
+        REGISTRY_USERNAME: ${{ secrets.REGISTRY_USERNAME }}
+        REGISTRY_PASSWORD: ${{ secrets.REGISTRY_PASSWORD }}

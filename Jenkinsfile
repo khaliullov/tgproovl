@@ -1,20 +1,27 @@
 node {
     def app
+    def image
 
     stage('Clone repository') {
        copyFilesToWorkSpace()
     }
 
     stage('Build image') {
-        app = docker.build("${env.GITHUB_REPOSITORY}:0.0.1")
+        image = "${env.REGISTRY}/${env.GITHUB_REPOSITORY}:0.0.1"
+        app = docker.build(image)
     }
 
     stage('Push image') {
-        /*
-        docker.withRegistry('https://registry.hub.docker.com', 'docker-hub-credentials') {
-            app.push("${env.BUILD_NUMBER}")
-            app.push("latest")
-        } */
+        withCredentials([usernamePassword(credentialsId: 'docker-hub-credentials', usernameVariable: "${env.REGISTRY_USERNAME}", passwordVariable: "${env.REGISTRY_PASSWORD}")]) {
+            docker.withRegistry("${env.REGISTRY}", 'docker-hub-credentials') {
+                mysh "docker login -u ${USERNAME} -p ${PASSWORD}"
+                app.push(image)
+            }
+        }
+    }
+
+    stage('Clean') {
+        sh "docker rmi $image"
     }
 }
 
