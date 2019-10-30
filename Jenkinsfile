@@ -1,3 +1,11 @@
+properties([
+    parameters([
+        credentials(name: 'creds_param', defaultValue: 'registry',
+                    credentialType: 'com.cloudbees.plugins.credentials.impl.UsernamePasswordCredentialsImpl',
+                    description: '')
+    ])
+])
+
 node {
     def app
     def image
@@ -12,10 +20,14 @@ node {
     }
 
     stage('Push image') {
-        docker.withRegistry("${env.REGISTRY}", 'docker-hub-credentials') {
-            withCredentials([usernamePassword(credentialsId: 'docker-hub-credentials', usernameVariable: "REGISTRY_USERNAME", passwordVariable: "REGISTRY_PASSWORD")]) {
+        withCredentials([usernamePassword(credentialsId: '${creds_param}',
+                         usernameVariable: "REGISTRY_USERNAME",
+                         passwordVariable: "REGISTRY_PASSWORD")]) {
+            mysh "docker login -u $REGISTRY_USERNAME -p $REGISTRY_PASSWORD ${env.REGISTRY}"
+            docker.withRegistry("${env.REGISTRY}", '${creds_param}') {
                 app.push(image)
             }
+            mysh "docker logout ${env.REGISTRY}"
         }
     }
 
