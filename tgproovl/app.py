@@ -21,12 +21,10 @@ try:
     from extendedpersistence import ExtendedPersistence
     from tgclient import TgClient
     from tgproovlworker import TgproovlWorker
-    APP_CONFIG = os.environ.get('TGBOT_CONFIG', 'config.MainConfig')
 except ModuleNotFoundError:
     from tgproovl.extendedpersistence import ExtendedPersistence
     from tgproovl.tgclient import TgClient
     from tgproovl.tgproovlworker import TgproovlWorker
-    APP_CONFIG = os.environ.get('TGBOT_CONFIG', 'tgproovl.config.MainConfig')
 
 
 PASSWORD, CONFIG, USERS, NEW_USER, SMS, PHONES_MENU, NEW_PHONE, PHONE_EDIT,\
@@ -41,6 +39,7 @@ SMS_STATUS_RU = {
 
 app = Flask(__name__)
 scheduler = APScheduler()
+APP_CONFIG = os.environ.get('TGPROOVL_CONFIG', 'config.MainConfig')
 app.config.from_object(APP_CONFIG)
 app.bot = telegram.Bot(app.config['TELEGRAM_TOKEN'])
 app.translator = Translator()
@@ -48,16 +47,18 @@ app.bot_persistence = ExtendedPersistence(filename=app.config['PERSISTENCE_PATH'
 app.dispatcher = Dispatcher(bot=app.bot, update_queue=None,
                             workers=app.config['TELEGRAM_WORKERS'],
                             persistence=app.bot_persistence, use_context=True)
-app.bot.setWebhook(url='https://%s%s%s' % (app.config['SERVER_NAME'],
-                                           app.config['APPLICATION_ROOT'],
-                                           app.config['TELEGRAM_TOKEN']))
+app.bot.setWebhook(url='%s://%s%s%s' % (app.config['PREFERRED_URL_SCHEME'],
+                                        app.config['SERVER_NAME'],
+                                        app.config['APPLICATION_ROOT'],
+                                        app.config['TELEGRAM_TOKEN']))
 app.human = TgClient(app.config['TELEGRAM_API_ID'],
                      app.config['TELEGRAM_API_HASH'],
                      use_message_database=False, tdlib_verbosity=2,
                      phone=app.config['TELEGRAM_PHONE'],
-                     database_encryption_key='abret' + app.config['TELEGRAM_PHONE'] + 'bgty',
+                     database_encryption_key=app.config['TDLIB_ENCRYPTION_KEY'],
+                     files_directory=app.config['TDLIB_FILES_DIRECTORY'],
                      system_version='Linux',
-                     library_path='/usr/lib/libtdjson.so.1.5.1')
+                     library_path=app.config['TDLIB_PATH'])
 lock = threading.Lock()
 logger = logging.getLogger(__name__)
 app.queue = Queue(maxsize=1000)
@@ -221,7 +222,7 @@ def init_receiver(phone):
 
 
 def send_sms(_from, to, text, tariff=app.config['PROOVL_TARIFF']):
-    r = requests.post('https://tv.localix.ru/tgproovl/send.php',  # 'https://www.proovl.com/api/balance.php',
+    r = requests.post(app.config['PROOVL_API_PREFIX'] + 'send.php',
                       params={'user': app.config['PROOVL_USER'],
                               'token': app.config['PROOVL_TOKEN'],
                               'route': tariff,
@@ -534,7 +535,7 @@ def handle_cancel_query(update, context):
 
 
 def handle_balance(update, context):
-    r = requests.get('https://www.proovl.com/api/balance.php',
+    r = requests.get(app.config['PROOVL_API_PREFIX'] + 'balance.php',
                      params={'user': app.config['PROOVL_USER'],
                              'token': app.config['PROOVL_TOKEN']})
     app.queue.put((send_bot_message, {
@@ -796,15 +797,12 @@ def handle_chat_stop(update, context):
 
 @app.route(app.config['APPLICATION_ROOT'] + 'send.php', methods=['POST'])
 def fake_send_sms():
-    token = request.values.get('token')
-    from_ = request.values.get('from')
-    id_ = request.values.get('id')
-    to = request.values.get('to')
-    text = request.values.get('text')
-    status = request.values.get('status')
-    #return 'Sent;' + text
     return 'Sent;1'
-    return 'Error;Проверка ошибки'
+
+
+@app.route(app.config['APPLICATION_ROOT'] + 'balance.php', methods=['GET'])
+def fake_balance():
+    return '10.00'
 
 
 def real_handle_sms(message, context):
@@ -1076,7 +1074,8 @@ def human_connection_state_handler(update):
 
 
 def human_incoming_handler(update):
-    if update.ID == 'updateNewMessage' and update.message.ID == 'message' and \
+    if type(update) != dict and update.ID == 'updateNewMessage' and \
+            update.message.ID == 'message' and \
             update.message.content.ID == 'messageText' and \
             update.message.content.text.ID == 'formattedText':
         text = update.message.content.text.text

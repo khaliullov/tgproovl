@@ -7,7 +7,9 @@ node {
     }
 
     stage('Build image') {
-        image = "${env.REGISTRY}".replace("https://", "") + "/${env.GITHUB_REPOSITORY}:0.0.1"
+        def currentVersion = sh(returnStdout: true,
+                                script: 'sed -n -e "/^__version__/p" tgproovl/__init__.py | cut -d\\" -f2').trim()
+        image = "${env.REGISTRY}".replace("https://", "") + "/${env.GITHUB_REPOSITORY}:$currentVersion"
         app = docker.build(image)
     }
 

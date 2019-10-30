@@ -1,0 +1,79 @@
+apiVersion: apps/v1beta1
+kind: Deployment
+metadata:
+  name: tgproovl-web
+  labels:
+    app: tgproovl-web
+spec:
+  replicas: 1
+  selectors:
+    app: tgproovl-web
+  template:
+    metadata:
+      labels:
+        app: tgproovl-web
+    spec:
+      containers:
+      - name: tgproovl-web
+        image: {{ .Values.image }}:{{ .Values.tag }}
+        imagePullPolicy: Always
+        command: ["/opt/apps/tgproovl/bin/gunicorn", "-b", "{{ .Values.host }}:{{ .Values.port }}", "tgproovl.app:app"]
+        env:
+        - name: FLASK_ENV
+          value: "production"
+        - name: TGPROOVL_CONFIG
+          value: "{{ .Values.config }}"
+        - name: TGPROOVL_SECRET_KEY
+          value: "{{ .Values.secretKey }}"
+        - name: TGPROOVL_PROOVL_USER
+          value: "{{ .Values.proovlUser }}"
+        - name: TGPROOVL_PROOVL_TOKEN
+          value: "{{ .Values.proovlToken }}"
+        - name: TGPROOVL_PROOVL_TARIFF
+          value: "{{ .Values.proovlTariff }}"
+        - name: TGPROOVL_PROOVL_API_PREFIX
+          value: "{{ .Values.proovlApiPrefix }}"
+        - name: TGPROOVL_URL_SCHEME
+          value: "{{ .Values.urlScheme }}"
+        - name: TGPROOVL_URL_HOST
+          value: "{{ .Values.urlHost }}"
+        - name: TGPROOVL_URL_PATH_PREFIX
+          value: "{{ .Values.urlPathPrefix }}"
+        - name: TGPROOVL_TELEGRAM_TOKEN
+          value: "{{ .Values.telegramToken }}"
+        - name: TGPROOVL_TELEGRAM_DEVELOPER
+          value: "{{ .Values.telegramDeveloper }}"
+        - name: TGPROOVL_TELEGRAM_OWNER
+          value: "{{ .Values.telegramOwner }}"
+        - name: TGPROOVL_TELEGRAM_API_ID
+          value: "{{ .Values.telegramApiId }}"
+        - name: TGPROOVL_TELEGRAM_API_HASH
+          value: "{{ .Values.telegramApiHash }}"
+        - name: TGPROOVL_TELEGRAM_PHONE
+          value: "{{ .Values.telegramPhone }}"
+        - name: TGPROOVL_BOT_PASSWORD
+          value: "{{ .Values.botPassword }}"
+        - name: TGPROOVL_PERSISTENCE_PATH
+          value: "{{ .Values.persistencePath }}"
+        - name: TGPROOVL_TDLIB_PATH
+          value: "{{ .Values.tdlibPath }}"
+        - name: TGPROOVL_TDLIB_ENCRYPTION_KEY
+          value: "{{ .Values.tdlibEncryptionKey }}"
+        - name: TGPROOVL_TDLIB_FILES_DIRECTORY
+          value: "{{ .Values.tdlibFilesDirectory }}"
+        - name: TGPROOVL_SMS_HALF_TIMEOUT
+          value: "{{ .Values.smsHalfTimeout }}"
+        - name: TGPROOVL_CHAT_HALF_TIMEOUT
+          value: "{{ .Values.chatHalfTimeout }}"
+        ports:
+          - containerPort: {{ .Values.port }}
+        volumeMounts:
+          - name: tgproovl-volume-mount
+            mountPath: {{ .Values.mountPoint }}
+      volumes:
+        - name: tgproovl-volume-mount
+          persistentVolumeClaim:
+            claimName: tgproovl-pvc
+      restartPolicy: Always
+      imagePullSecrets:
+        - name: {{ .Values.imagePullSecrets }}

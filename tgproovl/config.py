@@ -10,13 +10,15 @@ class MainConfig(object):
     FLASK_RUN_PORT = int(os.environ.get('TGPROOVL_PORT', 8080))
     TELEGRAM_TOKEN = os.environ.get('TGPROOVL_TELEGRAM_TOKEN', '<token>')
     PERSISTENCE_PATH = os.environ.get('TGPROOVL_PERSISTENCE_PATH',
-                                      '/tmp/tgproovl.state')
+                                      '/mnt/tgproovl.state')
     TELEGRAM_WORKERS = int(os.environ.get('TGPROOVL_TELEGRAM_WORKERS', 4))
     BOT_PASSWORD = os.environ.get('TGPROOVL_BOT_PASSWORD', '')
     SECRET_KEY = os.environ.get('TGPROOVL_SECRET_KEY', '<secret_key>').encode('ascii')
     PROOVL_USER = os.environ.get('TGPROOVL_PROOVL_USER', '')
     PROOVL_TOKEN = os.environ.get('TGPROOVL_PROOVL_TOKEN', '')
-    PROOVL_TARIFF = int(os.environ.get('TGPROOVL_PROOVL_TARIFFT', 2))
+    PROOVL_TARIFF = int(os.environ.get('TGPROOVL_PROOVL_TARIFF', 2))
+    PROOVL_API_PREFIX = os.environ.get('TGPROOVL_PROOVL_API_PREFIX',
+                                       'https://www.proovl.com/api/')
     TELEGRAM_DEVELOPER = int(os.environ.get('TGPROOVL_TELEGRAM_DEVELOPER', -1))
     TELEGRAM_OWNER = int(os.environ.get('TGPROOVL_TELEGRAM_OWNER', -1))
     TELEGRAM_PHONE = os.environ.get('TGPROOVL_TELEGRAM_PHONE', '')
@@ -24,3 +26,7 @@ class MainConfig(object):
     TELEGRAM_API_HASH = os.environ.get('TGPROOVL_TELEGRAM_API_HASH', '')
     SMS_HALF_TIMEOUT = int(os.environ.get('TGPROOVL_SMS_HALF_TIMEOUT', 900))
     CHAT_HALF_TIMEOUT = int(os.environ.get('TGPROOVL_CHAT_HALF_TIMEOUT', 1800))
+    TDLIB_PATH = os.environ.get('TGPROOVL_TDLIB_PATH',
+                                '/usr/lib/libtdjson.so.1.5.1')
+    TDLIB_ENCRYPTION_KEY = os.environ.get('TGPROOVL_TDLIB_ENCRYPTION_KEY', '')
+    TDLIB_FILES_DIRECTORY = os.environ.get('TGPROOVL_TDLIB_FILES_DIRECTORY', '')
