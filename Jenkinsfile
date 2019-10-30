@@ -12,9 +12,9 @@ node {
     }
 
     stage('Push image') {
-        withCredentials([usernamePassword(credentialsId: 'docker-hub-credentials', usernameVariable: "${env.REGISTRY_USERNAME}", passwordVariable: "${env.REGISTRY_PASSWORD}")]) {
+        withCredentials([usernamePassword(credentialsId: 'docker-hub-credentials', usernameVariable: "REGISTRY_USERNAME", passwordVariable: "REGISTRY_PASSWORD")]) {
+            mysh "docker login -u ${env.REGISTRY_USERNAME} -p ${env.REGISTRY_PASSWORD} ${env.REGISTRY}"
             docker.withRegistry("${env.REGISTRY}", 'docker-hub-credentials') {
-                mysh "docker login -u ${USERNAME} -p ${PASSWORD}"
                 app.push(image)
             }
         }
