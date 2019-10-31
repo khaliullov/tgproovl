@@ -37,8 +37,8 @@ class ExtendedPersistence(PicklePersistence):
     def dump_singlefile(self):
         with open(self.filename, "wb") as f:
             all = {'conversations': self.conversations,
-                   'user_data': self.user_data,
-                   'chat_data': self.chat_data,
+                   'user_data': {k: v for k, v in self.user_data.items() if len(v)},
+                   'chat_data': {k: v for k, v in self.chat_data.items() if len(v)},
                    'state': self.state}
             pickle.dump(all, f)
 
@@ -75,9 +75,11 @@ class ExtendedPersistence(PicklePersistence):
                 self.dump_singlefile()
         else:
             if self.user_data:
-                self.dump_file("{}_user_data".format(self.filename), self.user_data)
+                self.dump_file("{}_user_data".format(self.filename),
+                               {k: v for k, v in self.user_data.items() if len(v)})
             if self.chat_data:
-                self.dump_file("{}_chat_data".format(self.filename), self.chat_data)
+                self.dump_file("{}_chat_data".format(self.filename),
+                               {k: v for k, v in self.chat_data.items() if len(v)})
             if self.conversations:
                 self.dump_file("{}_conversations".format(self.filename), self.conversations)
             if self.state:

@@ -74,6 +74,7 @@ def remove_chat(update):
     chat_id = update['chat_id']
     receiver = update['receiver']
     sender = update['sender']
+    attempt = update.get('try', 0)
     result = app.human._send_data({'@type': 'searchChatMembers',
                                    'limit': 100,
                                    'chat_id': chat_id})
@@ -87,9 +88,10 @@ def remove_chat(update):
             users.add(member.user_id)
         if app.bot_persistence.state['self'] in users:
             users.discard(app.bot_persistence.state['self'])
-            users.add(app.bot_persistence.state['self'])
+        user_ids = list(users)
+        user_ids.append(app.bot_persistence.state['self'])
         error = False
-        for user_id in users:
+        for user_id in user_ids:
             result = app.human._send_data({
                 '@type': 'setChatMemberStatus',
                 'user_id': user_id,
@@ -102,7 +104,7 @@ def remove_chat(update):
             if not result.update:
                 error = True
                 break
-        if not error:
+        if not error or attempt >= 5:
             result = app.human._send_data({
                 '@type': 'deleteChatHistory',
                 'chat_id': chat_id,
@@ -176,6 +178,15 @@ def check_sms_and_chats():
                     }), timeout=10)
                     continue
             if chat['last_message'] + app.config['CHAT_HALF_TIMEOUT'] * 2 < now:
+                app.human._send_data({'@type': 'sendMessage',
+                                      'chat_id': chat['chat_id'],
+                                      'input_message_content': {
+                                          '@type': 'inputMessageText',
+                                          'text': {
+                                              '@type': 'formattedText',
+                                              'text': '/cancel'
+                                          }
+                                      }})
                 app.queue.put((remove_chat, {
                     'chat_id': chat['chat_id'],
                     'receiver': receiver,
@@ -519,6 +530,7 @@ def handle_password(update, context):
             'message': update.message,
             'text': 'Пока!'
         }), timeout=10)
+    context.chat_data.clear()
     return ConversationHandler.END
 
 
@@ -531,6 +543,7 @@ def handle_cancel_query(update, context):
         'message': message,
         'text': 'Береги себя!',
     }), timeout=10)
+    context.chat_data.clear()
     return ConversationHandler.END
 
 
@@ -723,9 +736,13 @@ def handle_phones(update, context):
 def handle_chat_start(update, context):
     init_state()
     context.chat_data['chat_id'] = update.message.chat.id
-    chat = app.bot.get_chat(context.chat_data['chat_id'])
-    title = chat.description or update.message.chat.title
-    if not chat.description:
+    try:
+        chat = app.bot.get_chat(context.chat_data['chat_id'])
+    except Exception:
+        title = update.message.chat.title
+    else:
+        title = chat.description or update.message.chat.title
+    if not chat or not chat.description:
         app.human._send_data({'@type': 'setChatDescription',
                               'chat_id': context.chat_data['chat_id'],
                               'description': title})
@@ -747,7 +764,7 @@ def handle_chat_start(update, context):
             'tariff': app.config['PROOVL_TARIFF'],
         })
     app.bot_persistence.save_state()
-    text = 'Абоненту: *{0}*'.format(esc_yml(context.chat_data['receiver']))
+    text = 'На номер: *{0}*'.format(esc_yml(context.chat_data['receiver']))
     if app.bot_persistence.state['phones'][context.chat_data['receiver']]['nick'] != context.chat_data['receiver']:
         app.human._send_data({'@type': 'setChatTitle',
                               'chat_id': context.chat_data['chat_id'],
@@ -792,6 +809,7 @@ def handle_chat_stop(update, context):
     #app.bot_persistence.state['phones'][context.chat_data[
     #    'receiver']]['chats'].pop(context.chat_data['sender'], None)
     #app.bot_persistence.update_state(app.bot_persistence.state)
+    context.chat_data.clear()
     return ConversationHandler.END
 
 
@@ -1074,7 +1092,7 @@ def human_connection_state_handler(update):
 
 
 def human_incoming_handler(update):
-    if type(update) != dict and update.ID == 'updateNewMessage' and \
+    if hasattr(update, 'ID') and update.ID == 'updateNewMessage' and \
             update.message.ID == 'message' and \
             update.message.content.ID == 'messageText' and \
             update.message.content.text.ID == 'formattedText':
@@ -1098,6 +1116,7 @@ def handle_human_init(update, context):
             data[text[0]] = text[1]
             data['@type'] = 'checkAuthenticationCode'
     app.human._send_data(data, result_id='updateAuthorizationState')
+    context.chat_data.clear()
     return ConversationHandler.END
 
 
@@ -1159,7 +1178,8 @@ def main():
     )
     sms_handler = ConversationHandler(
         per_user=False,
-        entry_points=[MessageHandler(Filters.status_update.chat_created | Filters.status_update.new_chat_members, handle_chat_start),
+        entry_points=[MessageHandler(Filters.status_update.chat_created | Filters.status_update.new_chat_members,
+                                     handle_chat_start),
                       CommandHandler('help', handle_chat_start)],
         states={
             SMS: [MessageHandler(Filters.text, handle_sms),
@@ -1167,7 +1187,9 @@ def main():
                                        pattern='^(.+)$'),
                   CommandHandler(['fr', 'en', 'de'], handle_translate)],
         },
-        fallbacks=[MessageHandler(Filters.status_update.left_chat_member, handle_chat_stop)]
+        fallbacks=[MessageHandler(Filters.status_update.left_chat_member,
+                                  handle_chat_stop),
+                   CommandHandler('cancel', handle_chat_stop)]
     )
     app.dispatcher.add_handler(CommandHandler('setcode', handle_human_init))
     app.dispatcher.add_handler(CommandHandler('setpassword', handle_human_init))
