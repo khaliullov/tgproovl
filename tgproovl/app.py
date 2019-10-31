@@ -37,7 +37,7 @@ SMS_STATUS_RU = {
 }
 
 
-app = Flask(__name__)
+app = Flask('tgproovl')
 scheduler = APScheduler()
 APP_CONFIG = os.environ.get('TGPROOVL_CONFIG', 'config.MainConfig')
 app.config.from_object(APP_CONFIG)
@@ -60,7 +60,8 @@ app.human = TgClient(app.config['TELEGRAM_API_ID'],
                      system_version='Linux',
                      library_path=app.config['TDLIB_PATH'])
 lock = threading.Lock()
-logger = logging.getLogger(__name__)
+logger = logging.getLogger('tgproovl')
+loghandler = logging.StreamHandler(sys.stdout)
 app.queue = Queue(maxsize=1000)
 app.worker = TgproovlWorker(app.queue)
 
@@ -161,9 +162,9 @@ def check_sms_and_chats():
     if not app.bot_persistence.state \
             or 'phones' not in app.bot_persistence.state \
             or 'sms' not in app.bot_persistence.state:
-        logger.warn('skipping SMS and Chats check')
+        logger.warning('skipping SMS and Chats check')
         return
-    logger.info('Running SMS and Chats check')
+    logger.debug('Running SMS and Chats check')
     for receiver in app.bot_persistence.state['phones']:
         for sender in app.bot_persistence.state['phones'][receiver]['chats']:
             chat = app.bot_persistence.state['phones'][receiver]['chats'][sender]
@@ -215,8 +216,8 @@ def check_sms_and_chats():
         with lock:
             app.bot_persistence.state['sms'].pop(item, None)
     app.bot_persistence.save_state()
-    logger.debug('state: %s', app.bot_persistence.state)
-    logger.info('SMS and Chats check ended')
+    logger.debug('state: %s', app.bot_persistence.__dict__)
+    logger.debug('SMS and Chats check ended')
 
 
 def init_receiver(phone):
@@ -309,7 +310,7 @@ def process_status(update):
                 app.bot_persistence.state['sms'][message_id] = sms
         app.bot_persistence.save_state()
     else:
-        print('Unknown message ID {0} updated with state {1}'.format(_id, status))
+        logger.error('Unknown message ID {0} updated with state {1}'.format(_id, status))
     return True
 
 
@@ -417,7 +418,7 @@ def proovl_webhook():
     to = request.values.get('to')
     text = request.values.get('text')
     status = request.values.get('status')
-    logger.debug('From: %s, to: %s, msg_id: %s, status: %s, text: %s', _from, _id, to, text, status)
+    logger.info('From: %s, to: %s, msg_id: %s, status: %s, text: %s', _from, _id, to, text, status)
     payload = {
         'token': token,
         'from': _from,
@@ -1120,6 +1121,21 @@ def handle_human_init(update, context):
     return ConversationHandler.END
 
 
+def handle_loglevel(update, context):
+    text = update.message.text.lstrip('/set').split(' ', 1)
+    if len(text) == 2 and hasattr(logging, text[1]):
+        loglevel = getattr(logging, text[1])
+        logger.setLevel(loglevel)
+        loghandler.setLevel(loglevel)
+        app.queue.put((send_bot_message, {
+            'message': update.message,
+            'text': 'Logging set to level *{0}*'.format(loglevel),
+            'parse_mode': telegram.ParseMode.MARKDOWN
+        }), timeout=10)
+    context.chat_data.clear()
+    return ConversationHandler.END
+
+
 def handle_error(update, context):
     trace = "".join(traceback.format_tb(sys.exc_info()[2]))
     payload = ""
@@ -1132,12 +1148,18 @@ def handle_error(update, context):
     if update.poll:
         payload += f' с poll id {update.poll.id}.'
     text = f"Эй!\nОшибка *{context.error}* случилась{payload}. полный traceback:\n\n```{trace}```"
-    print(text)
+    logger.error(text)
     app.bot.send_message(chat_id=app.config['TELEGRAM_DEVELOPER'], text=text,
                          parse_mode=telegram.ParseMode.MARKDOWN)
 
 
 def main():
+    logger.setLevel(logging.INFO)
+    loghandler.setLevel(logging.INFO)
+    formatter = logging.Formatter(
+        '%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+    loghandler.setFormatter(formatter)
+    logger.addHandler(loghandler)
     conv_handler = ConversationHandler(
         entry_points=[CommandHandler('start', start)],
         states={
@@ -1193,6 +1215,7 @@ def main():
     )
     app.dispatcher.add_handler(CommandHandler('setcode', handle_human_init))
     app.dispatcher.add_handler(CommandHandler('setpassword', handle_human_init))
+    app.dispatcher.add_handler(CommandHandler('setloglevel', handle_loglevel))
     app.dispatcher.add_handler(conv_handler)
     app.dispatcher.add_handler(sms_handler)
     app.dispatcher.add_error_handler(handle_error)

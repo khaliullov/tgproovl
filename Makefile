@@ -35,7 +35,7 @@ run: venv/bin/python .env
 	TGPROOVL_TDLIB_ENCRYPTION_KEY=$(TGPROOVL_TDLIB_ENCRYPTION_KEY) \
 	TGPROOVL_TDLIB_FILES_DIRECTORY=$(TGPROOVL_TDLIB_FILES_DIRECTORY) \
 	TGPROOVL_PERSISTENCE_PATH=$(TGPROOVL_PERSISTENCE_PATH) \
-		./venv/bin/python ./tgproovl/app.py
+		./venv/bin/python ./bin/tgproovl
 
 clean:
 	rm -rf venv

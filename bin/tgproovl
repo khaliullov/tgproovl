@@ -1,0 +1,11 @@
+#!env python
+
+import os, sys
+sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
+
+from tgproovl.app import app
+
+
+if __name__ == '__main__':
+    app.run(host=app.config['FLASK_RUN_HOST'],
+            port=app.config['FLASK_RUN_PORT'], threaded=True)

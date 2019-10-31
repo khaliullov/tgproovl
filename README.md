@@ -8,6 +8,7 @@ Telegram bot for proovl
 1. Build and publish Docker image into your k8s registry.
 2. Create `values.yaml` with your configuration.
 
+Example:
 
     image: "<you registry and path>/tgproovl"
     imagePullSecrets: "regred"
@@ -29,9 +30,10 @@ Telegram bot for proovl
 
 3. Install or upgrade you Helm Chart.
 
+Run install:
 
     helm install ./k8s -n tgproovl -f values.yaml
 
-or
+or upgrade:
 
     helm upgrade tgproovl ./k8s -i -f values.yaml

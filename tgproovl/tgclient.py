@@ -1,6 +1,5 @@
 import logging
 from typing import Optional, Type, Callable
-import sys
 
 from pytglib import VERSION
 from pytglib.api.utils import Object
@@ -10,12 +9,6 @@ from pytglib.worker import BaseWorker, SimpleWorker
 
 
 logger = logging.getLogger(__name__)
-logger.setLevel(logging.DEBUG)
-handler = logging.StreamHandler(sys.stdout)
-handler.setLevel(logging.DEBUG)
-formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-handler.setFormatter(formatter)
-logger.addHandler(handler)
 
 
 class FixedWorker(SimpleWorker):
@@ -82,7 +75,7 @@ class TgClient(Telegram):
         async_result = AsyncResult(client=self, result_id=result_id)
         data['@extra']['request_id'] = async_result.id
 
-        logger.info('Sending to TG: %s', data)
+        logger.debug('Sending to TG: %s', data)
         self._tdjson.send(data)
         self._results[async_result.id] = async_result
         async_result.request = data
