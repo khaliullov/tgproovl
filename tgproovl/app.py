@@ -418,7 +418,7 @@ def proovl_webhook():
     to = request.values.get('to')
     text = request.values.get('text')
     status = request.values.get('status')
-    logger.info('From: %s, to: %s, msg_id: %s, status: %s, text: %s', _from, _id, to, text, status)
+    logger.info('From: %s, to: %s, msg_id: %s, status: %s, text: %s', _from, to, _id, status, text)
     payload = {
         'token': token,
         'from': _from,
