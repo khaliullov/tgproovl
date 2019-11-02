@@ -23,6 +23,8 @@ spec:
           value: "production"
         - name: TGPROOVL_CONFIG
           value: "{{ .Values.config }}"
+        - name: TGPROOVL_LOGLEVEL
+          value: "{{ .Values.logLevel }}"
         - name: TGPROOVL_SECRET_KEY
           value: "{{ .Values.secretKey }}"
         - name: TGPROOVL_PROOVL_USER

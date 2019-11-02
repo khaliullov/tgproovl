@@ -1,6 +1,7 @@
 image: "leandr/tgproovl"
 imagePullSecrets: "regcred"
-tag: "0.0.5"
+logLevel: "INFO"
+tag: "0.0.6"
 host: "0.0.0.0"
 port: 8080
 servicePort: 8080

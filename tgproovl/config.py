@@ -3,6 +3,7 @@ import os
 
 class MainConfig(object):
     DEBUG = bool(os.environ.get('TGPROOVL_DEBUG', False))
+    LOGLEVEL = os.environ.get('TGPROOVL_LOGLEVEL', 'INFO')
     APPLICATION_ROOT = os.environ.get('TGPROOVL_URL_PATH_PREFIX', '/')
     PREFERRED_URL_SCHEME = os.environ.get('TGPROOVL_URL_SCHEME', 'https')
     SERVER_NAME = os.environ.get('TGPROOVL_URL_HOST', 'bot.example.com')

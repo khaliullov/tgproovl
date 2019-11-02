@@ -337,8 +337,11 @@ def process_incoming_sms(update):
     status = update.get('status', None)
     init_state()
     init_receiver(to)
-    translation = app.translator.translate(text, dest='ru')
-    if translation.text != text:
+    try:
+        translation = app.translator.translate(text, dest='ru')
+    except Exception as exc:
+        logger.error('Translation error: %s', str(exc))
+    if translation and translation.text != text:
         text = "_{0}_\nПеревод (c *{1}* на ru): *{2}*".format(esc_yml(text), esc_yml(translation.src), esc_yml(translation.text))
     else:
         text = '*{0}*'.format(esc_yml(text))
@@ -418,7 +421,8 @@ def proovl_webhook():
     to = request.values.get('to')
     text = request.values.get('text')
     status = request.values.get('status')
-    logger.info('From: %s, to: %s, msg_id: %s, status: %s, text: %s', _from, to, _id, status, text)
+    logger.info('From: %s, to: %s, msg_id: %s, status: %s, text: %s',
+                _from, to, _id, status, text)
     payload = {
         'token': token,
         'from': _from,
@@ -1040,14 +1044,17 @@ def handle_edit_phone_query(update, context):
 def handle_translate(update, context):
     dest, text = update.message.text.split(' ', 1)
     dest = dest.lstrip('/')
-    translation = app.translator.translate(text, src='ru', dest=dest)
+    try:
+        translation = app.translator.translate(text, src='ru', dest=dest)
+    except Exception as exc:
+        logger.error('Translation error: %s', str(exc))
     keyboard = None
-    if translation.text != text:
+    if translation and translation.text != text:
         text = '*{1}*'.format(translation.dest, translation.text)
         keyboard = telegram.InlineKeyboardMarkup([[telegram.InlineKeyboardButton('Отправить',
                                                                                  callback_data='Отправить')]])
     else:
-        text = 'Перевод такой же!'
+        text = 'Перевод такой же или переводчик сейчас недоступен!'
     app.queue.put((send_bot_message, {
         'message': update.message,
         'text': text,
@@ -1093,16 +1100,30 @@ def human_connection_state_handler(update):
 
 
 def human_incoming_handler(update):
+    text = ''
+    chat_id = 0
+    message_id = 0
     if hasattr(update, 'ID') and update.ID == 'updateNewMessage' and \
             update.message.ID == 'message' and \
             update.message.content.ID == 'messageText' and \
             update.message.content.text.ID == 'formattedText':
         text = update.message.content.text.text
-        if text.startswith('На номер: '):
-            app.human._send_data({'@type': 'pinChatMessage',
-                                  'chat_id': update.message.chat_id,
-                                  'message_id': update.message.id,
-                                  'disable_notification': True})
+        chat_id = update.message.chat_id
+        message_id = update.message.id
+    if type(update) == dict and '@type' in update and \
+            update['@type'] == 'updateNewMessage' and \
+            'message' in update and 'content' in update['message'] and \
+            'text' in update['message']['content']:
+        message = update['message']['content']['text']
+        if hasattr(message, 'ID') and message.ID == 'formattedText':
+            text = message.text
+            chat_id = update['message']['chat_id']
+            message_id = update['message']['id']
+    if text.startswith('На номер: ') and message_id and chat_id:
+        app.human._send_data({'@type': 'pinChatMessage',
+                              'chat_id': chat_id,
+                              'message_id': message_id,
+                              'disable_notification': True})
 
 
 def handle_human_init(update, context):
@@ -1154,8 +1175,8 @@ def handle_error(update, context):
 
 
 def main():
-    logger.setLevel(logging.INFO)
-    loghandler.setLevel(logging.INFO)
+    logger.setLevel(getattr(logging, app.config['LOGLEVEL']))
+    loghandler.setLevel(getattr(logging, app.config['LOGLEVEL']))
     formatter = logging.Formatter(
         '%(asctime)s - %(name)s - %(levelname)s - %(message)s')
     loghandler.setFormatter(formatter)

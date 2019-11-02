@@ -9,7 +9,7 @@ deleting chats after no new SMS in chat.
 
 Workflow:
 
-On each incoming SMS bot creates new chat named 'from -> to'. In this chat
+On each incoming SMS bot creates new chat named `<from> → <to>`. In this chat
 operator could respond to this messages simply be sending text to the chat.
 After defined timeout chat automatically destroyed.
 
@@ -19,7 +19,17 @@ number (something like
 
 [proovl docs](https://www.proovl.com/ru/sms-api)
 
-Bot configuration
+
+Table of Contents
+-----------------
+
+   * [App configuration](#app-configuration)
+   * [Starting locally](#starting-locally)
+   * [Proovl configuration](#proovl-configuration)
+   * [Bot configuration](#bot-configuration)
+   * [Deployment via Helm onto Kubernetes](#deployment-via-helm-onto-kubernetes)
+
+App configuration
 -----------------
 
 There are a lot of different settings to configure bot logic and credentials
@@ -54,12 +64,13 @@ processing incoming SMS.
 - `TGPROOVL_TELEGRAM_PHONE` - Phone number of Telegram Owner, for
 authenticating purposes. On first start bot will ask for code (and password)
 via private messages to Owner. Owner should respond with `/setcode 54321` or
-`/setpassword <TGPROOVL_BOT_PASSWORD>`. Note: due Telegram limitations code
+`/setpassword <Owner account password>`. Note: due Telegram limitations code
 should sent in reversed order, for example if code is `01234` then reply
 command should be `/setcode 43210`.
-- `TGPROOVL_TELEGRAM_API_ID` - Telegram API_ID from
+- `TGPROOVL_TELEGRAM_API_ID` - Telegram App api_id from
 [https://my.telegram.org/](https://my.telegram.org/). 
-- `TGPROOVL_TELEGRAM_API_HASH` - Telegram API hash also from the previous site.
+- `TGPROOVL_TELEGRAM_API_HASH` - Telegram App api_hah also from the previously
+mentioned site.
 - `TGPROOVL_SMS_HALF_TIMEOUT` - Time for monitoring that SMS was delivered to
 the recipient. By default is `900` seconds. When fired bot notificates operator
 that SMS still not delivered. Ignored that recipient responds with second or
@@ -71,6 +82,44 @@ located in `/usr/lib/libtdjson.so.1.5.1`
 - `TGPROOVL_TDLIB_ENCRYPTION_KEY` - 20 characters long encryption key for TDLib
 database.
 - `TDLIB_FILES_DIRECTORY` - path for storing TDLib database and files.
+
+Starting locally
+----------------
+
+It is possible to run bot locally on the laptop, using `Docker` and `Vagrant`.
+To do so, create `.env` file (see `.env.dist` as example). Fill all fields.
+Then:
+
+    vagrant up
+    vagrant ssh
+    make run
+
+this brings up `Flask` app and exposes 8080 port by default. You should
+manually configure your router, nginx to receive requests from Internet.
+
+Proovl configuration
+--------------------
+
+Each Proovl's number should be manually configured.
+Open [Numbers](https://www.proovl.com/console/index.php?option=numbers) section 
+and configure each number that you have: set `Forward all Inbound Messages to`
+to `URL` and `Forward all Inbound Messages to the following` to
+`<TGPROOVL_URL_SCHEME>://<TGPROOVL_URL_HOST><TGPROOVL_URL_PATH_PREFIX>/incoming_sms`.
+Also, the same URL should be configured in
+[API](https://www.proovl.com/console/index.php?option=api) section for 
+`URL for delivery reports` field.
+
+Bot configuration
+-----------------
+
+Each new number automatically added to bot's configuration on new SMS. But it
+possible to add them manually, set `nick` for each number and quick replies.
+Write `/start` private message to bot. Authenticate yourself if needed with
+`<TGPROOVL_BOT_PASSWORD>`. After that you can see Proovl balance, add/remove
+adminstators or/and operators and edit numbers. Each number could have `nick` -
+virtual user with whom other end chats. Also each number could have `site` -
+it could be social network account link. And also each number could have quick
+replies, for example: `greeting` - `Hello, I am Diego, 23 y.o. SF, CA.`, etc.
 
 Deployment via Helm onto Kubernetes
 -----------------------------------
@@ -91,8 +140,8 @@ Example:
     telegramToken: "<telegram bot token>"
     telegramDeveloper: "<telegram ID to send crash reports>"
     telegramOwner: "<main admin account for creating chats>"
-    telegramApiId: <API ID of telegram client>
-    telegramApiHash: "<API hash of telegram client>"
+    telegramApiId: <App api_id of telegram client>
+    telegramApiHash: "<App api_hash of telegram client>"
     telegramPhone: "<main accounts phone for auth>"
     tdlibPath: "/usr/lib/libtdjson.so.1.5.1"
     tdlibEncryptionKey: "<20 chars encryption key>"
@@ -107,3 +156,33 @@ Run install:
 or upgrade:
 
     helm upgrade tgproovl ./k8s -i -f values.yaml
+
+4. Configure Ingress. 
+
+The last thing is to manually configure your Ingress:
+
+    apiVersion: extensions/v1beta1
+    kind: Ingress
+    metadata:
+      name: docker-registry
+      annotations:
+        kubernetes.io/ingress.class: nginx
+        nginx.ingress.kubernetes.io/worker-shutdown-timeout: "60"
+        nginx.ingress.kubernetes.io/proxy-body-size: "0"
+        certmanager.k8s.io/issuer: letsencrypt-prod
+    spec:
+      tls:
+      - hosts:
+        - bot.example.com
+      rules:
+        - host: bot.example.com
+          http:
+            paths:
+            - backend:
+                serviceName: tgproovl-svc
+                servicePort: 8080
+              path: /tgproovl
+
+To apply run:
+
+    kubectl apply -f ingress.yaml
